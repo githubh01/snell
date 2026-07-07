@@ -106,11 +106,11 @@ detect_arch() {
 }
 
 choose_snell_major() {
-    echo
-    info "Choose Snell major version:"
-    echo "1. Snell v4"
-    echo "2. Snell v5"
-    echo "3. Snell v6 Beta"
+    echo >&2
+    info "Choose Snell major version:" >&2
+    echo "1. Snell v4" >&2
+    echo "2. Snell v5" >&2
+    echo "3. Snell v6 Beta" >&2
 
     while true; do
         read -rp "Select [1-3]: " choice
