@@ -52,10 +52,25 @@ has_command() {
 }
 
 wait_for_apt() {
-    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    while apt_is_busy; do
         warn "Waiting for another apt/dpkg process..."
         sleep 2
     done
+}
+
+apt_is_busy() {
+    if has_command fuser; then
+        fuser /var/lib/dpkg/lock >/dev/null 2>&1 && return 0
+        fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && return 0
+        fuser /var/cache/apt/archives/lock >/dev/null 2>&1 && return 0
+    fi
+
+    ps -eo comm= 2>/dev/null | grep -Eq '^(apt|apt-get|dpkg|unattended-upgr)$'
+}
+
+run_apt_get() {
+    wait_for_apt
+    DEBIAN_FRONTEND=noninteractive apt-get "$@"
 }
 
 install_packages() {
@@ -73,9 +88,8 @@ install_packages() {
     warn "Missing dependencies: ${missing[*]}"
 
     if has_command apt-get; then
-        wait_for_apt
-        apt-get update
-        apt-get install -y curl unzip gawk sed grep systemd
+        run_apt_get update
+        run_apt_get install -y curl unzip gawk sed grep systemd procps
     elif has_command dnf; then
         dnf install -y curl unzip gawk sed grep systemd
     elif has_command yum; then
@@ -91,8 +105,7 @@ install_anytls_packages() {
     install_packages
 
     if has_command apt-get; then
-        wait_for_apt
-        apt-get install -y ca-certificates
+        run_apt_get install -y ca-certificates
     elif has_command dnf; then
         dnf install -y ca-certificates
     elif has_command yum; then
