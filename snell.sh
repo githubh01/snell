@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,6 +26,16 @@ MAIN_CONF="${USERS_DIR}/snell-main.conf"
 SERVICE_FILE="/etc/systemd/system/snell.service"
 SERVICE_USER="snell"
 SERVICE_GROUP="snell"
+
+ANYTLS_DIR="/etc/AnyTLS"
+ANYTLS_BIN="${ANYTLS_DIR}/anytls-server"
+ANYTLS_CONFIG="${ANYTLS_DIR}/config.yaml"
+ANYTLS_CLIENT_FILE="${ANYTLS_DIR}/anytls.txt"
+ANYTLS_SERVICE_NAME="anytls.service"
+ANYTLS_SERVICE_FILE="/etc/systemd/system/${ANYTLS_SERVICE_NAME}"
+ANYTLS_TZ="Asia/Shanghai"
+ANYTLS_ALIAS="AnyTLS"
+ANYTLS_DOWNLOADED_VERSION=""
 
 info() { echo -e "${CYAN}$*${RESET}"; }
 ok() { echo -e "${GREEN}$*${RESET}"; }
@@ -74,6 +84,21 @@ install_packages() {
         apk add --no-cache curl unzip gawk sed grep
     else
         die "Unsupported package manager. Please install curl, unzip, awk, sed, and grep manually."
+    fi
+}
+
+install_anytls_packages() {
+    install_packages
+
+    if has_command apt-get; then
+        wait_for_apt
+        apt-get install -y ca-certificates
+    elif has_command dnf; then
+        dnf install -y ca-certificates
+    elif has_command yum; then
+        yum install -y ca-certificates
+    elif has_command apk; then
+        apk add --no-cache ca-certificates
     fi
 }
 
@@ -414,6 +439,118 @@ service_status() {
     systemctl --no-pager --full status snell || true
 }
 
+start_snell() {
+    require_root
+    systemctl start snell
+    service_status
+}
+
+stop_snell() {
+    require_root
+    systemctl stop snell
+    service_status
+}
+
+snell_logs() {
+    journalctl -u snell --no-pager -n 80 || true
+}
+
+snell_main_port() {
+    [ -f "${MAIN_CONF}" ] || return 0
+    extract_value listen "${MAIN_CONF}" | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
+}
+
+snell_main_psk() {
+    [ -f "${MAIN_CONF}" ] || return 0
+    extract_value psk "${MAIN_CONF}"
+}
+
+snell_main_dns() {
+    [ -f "${MAIN_CONF}" ] || return 0
+    extract_value dns "${MAIN_CONF}"
+}
+
+change_snell_port() {
+    local port
+    local psk
+    local dns
+
+    require_root
+    [ -f "${MAIN_CONF}" ] || die "Main Snell config not found. Please install Snell first."
+
+    port="$(prompt_port "$(snell_main_port)")"
+    psk="$(snell_main_psk)"
+    dns="$(snell_main_dns)"
+    dns="${dns:-1.1.1.1,8.8.8.8}"
+
+    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
+    systemctl restart snell 2>/dev/null || true
+    show_config
+}
+
+change_snell_psk() {
+    local port
+    local psk
+    local dns
+
+    require_root
+    [ -f "${MAIN_CONF}" ] || die "Main Snell config not found. Please install Snell first."
+
+    port="$(snell_main_port)"
+    dns="$(snell_main_dns)"
+    dns="${dns:-1.1.1.1,8.8.8.8}"
+    read -rp "New PSK [press Enter to generate]: " psk
+    psk="${psk:-$(random_psk)}"
+
+    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
+    systemctl restart snell 2>/dev/null || true
+    show_config
+}
+
+snell_menu() {
+    local choice
+
+    while true; do
+        clear
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}        Snell Manager${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo "1. Install / reinstall Snell"
+        echo "2. Update Snell binary"
+        echo "3. Show config"
+        echo "4. Change main port"
+        echo "5. Change main PSK"
+        echo "6. Restart service"
+        echo "7. Start service"
+        echo "8. Stop service"
+        echo "9. Show service status"
+        echo "10. Show logs"
+        echo "11. User config management"
+        echo "12. Uninstall Snell"
+        echo "0. Back"
+        echo -e "${CYAN}============================================${RESET}"
+        read -rp "Select [0-12]: " choice
+        case "${choice}" in
+            1) install_snell ;;
+            2) update_snell ;;
+            3) show_config ;;
+            4) change_snell_port ;;
+            5) change_snell_psk ;;
+            6) restart_snell ;;
+            7) start_snell ;;
+            8) stop_snell ;;
+            9) service_status ;;
+            10) snell_logs ;;
+            11) user_menu ;;
+            12) uninstall_snell ;;
+            0) return 0 ;;
+            *) err "Invalid option." ;;
+        esac
+        echo
+        read -rp "Press Enter to return to the Snell menu..." _
+    done
+}
+
 show_bbr_status() {
     local cc
     local qdisc
@@ -472,6 +609,448 @@ enable_bbr() {
     else
         warn "BBR is not active yet. A reboot or newer kernel may be required."
     fi
+}
+
+anytls_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) die "AnyTLS supports only amd64 and arm64 on this script. Current architecture: $(uname -m)" ;;
+    esac
+}
+
+anytls_random_port() {
+    local port
+
+    while true; do
+        if has_command shuf; then
+            port="$(shuf -i 2000-65000 -n 1)"
+        else
+            port="$(awk 'BEGIN{srand(); print int(2000 + rand() * 63000)}')"
+        fi
+        if ! is_port_used "${port}"; then
+            echo "${port}"
+            return 0
+        fi
+    done
+}
+
+valid_port() {
+    local port="${1:-}"
+    [[ "${port}" =~ ^[0-9]+$ ]] && [ "${port}" -ge 1 ] && [ "${port}" -le 65535 ]
+}
+
+is_port_used() {
+    local port="$1"
+
+    if has_command ss; then
+        ss -tuln | awk '{print $5}' | grep -Eq "[:.]${port}([[:space:]]|$)"
+    elif has_command lsof; then
+        lsof -i :"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    elif has_command netstat; then
+        netstat -tuln 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+    else
+        return 1
+    fi
+}
+
+anytls_prompt_port() {
+    local input
+
+    while true; do
+        echo "Press Enter for a random available port, or enter a custom port [1-65535]." >&2
+        read -rp "AnyTLS port: " input
+        if [ -z "${input:-}" ]; then
+            input="$(anytls_random_port)"
+        fi
+        if ! valid_port "${input}"; then
+            err "Invalid port: ${input}"
+            continue
+        fi
+        if is_port_used "${input}"; then
+            err "Port ${input} is already in use."
+            continue
+        fi
+        echo "${input}"
+        return 0
+    done
+}
+
+anytls_password() {
+    if has_command uuidgen; then
+        uuidgen
+    elif [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        random_psk
+    fi
+}
+
+urlencode() {
+    local s="$1"
+    local i
+    local c
+
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:$i:1}"
+        case "${c}" in
+            [a-zA-Z0-9.~_-]) printf '%s' "${c}" ;;
+            *) printf '%%%02X' "'${c}" ;;
+        esac
+    done
+}
+
+anytls_public_ip() {
+    local ip
+
+    ip="$(curl -fsSL --connect-timeout 5 -4 https://api.ipify.org 2>/dev/null || true)"
+    if [ -n "${ip}" ]; then
+        echo "${ip}"
+        return 0
+    fi
+
+    curl -fsSL --connect-timeout 5 https://api.ipify.org 2>/dev/null || true
+}
+
+anytls_latest_version() {
+    local version
+
+    version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/anytls/anytls-go/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+    [ -n "${version}" ] || die "Could not get the latest AnyTLS version from GitHub."
+    echo "${version}"
+}
+
+anytls_installed_version() {
+    if [ -f "${ANYTLS_SERVICE_FILE}" ]; then
+        grep '^X-AT-Version=' "${ANYTLS_SERVICE_FILE}" | sed -E 's/^X-AT-Version=//' || true
+    fi
+}
+
+anytls_is_installed() {
+    [ -x "${ANYTLS_BIN}" ] || [ -f "${ANYTLS_SERVICE_FILE}" ]
+}
+
+anytls_is_active() {
+    systemctl is-active "${ANYTLS_SERVICE_NAME}" >/dev/null 2>&1
+}
+
+anytls_config_port() {
+    [ -f "${ANYTLS_CONFIG}" ] || return 0
+    sed -nE 's/^[[:space:]]*listen:[[:space:]]*.*:([0-9]+)[[:space:]]*$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+}
+
+anytls_config_password() {
+    [ -f "${ANYTLS_CONFIG}" ] || return 0
+    sed -nE 's/^[[:space:]]*password:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+}
+
+anytls_write_config() {
+    local port="$1"
+    local password="$2"
+
+    mkdir -p "${ANYTLS_DIR}"
+    cat > "${ANYTLS_CONFIG}" <<EOF
+listen: :${port}
+auth:
+  type: password
+  password: ${password}
+EOF
+    chmod 600 "${ANYTLS_CONFIG}"
+}
+
+anytls_write_service() {
+    local version="$1"
+    local port="$2"
+    local password="$3"
+
+    if [ -z "${version}" ]; then
+        version="$(anytls_installed_version)"
+        version="${version:-unknown}"
+    fi
+
+    cat > "${ANYTLS_SERVICE_FILE}" <<EOF
+[Unit]
+Description=AnyTLS Server Service
+Documentation=https://github.com/anytls/anytls-go
+After=network-online.target
+Wants=network-online.target
+X-AT-Version=${version}
+
+[Service]
+Type=simple
+User=root
+Environment=TZ=${ANYTLS_TZ}
+ExecStart=${ANYTLS_BIN} -l 0.0.0.0:${port} -p ${password}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+anytls_download_binary() {
+    local version
+    local arch
+    local url
+    local tmpdir
+
+    install_anytls_packages
+    mkdir -p "${ANYTLS_DIR}"
+
+    arch="$(anytls_arch)"
+    version="$(anytls_latest_version)"
+    url="https://github.com/anytls/anytls-go/releases/download/${version}/anytls_${version#v}_linux_${arch}.zip"
+    tmpdir="$(mktemp -d)"
+
+    info "Downloading AnyTLS ${version} (${arch})..."
+    warn "Source: ${url}"
+
+    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/anytls.zip"
+    unzip -o "${tmpdir}/anytls.zip" -d "${tmpdir}" >/dev/null
+
+    [ -f "${tmpdir}/anytls-server" ] || {
+        rm -rf "${tmpdir}"
+        die "anytls-server was not found in the downloaded archive."
+    }
+
+    install -m 0755 "${tmpdir}/anytls-server" "${ANYTLS_BIN}"
+    rm -rf "${tmpdir}"
+    ANYTLS_DOWNLOADED_VERSION="${version}"
+}
+
+anytls_restart() {
+    systemctl daemon-reload
+    systemctl enable "${ANYTLS_SERVICE_NAME}" >/dev/null
+    systemctl restart "${ANYTLS_SERVICE_NAME}"
+    systemctl --no-pager --full status "${ANYTLS_SERVICE_NAME}" | sed -n '1,8p' || true
+}
+
+anytls_client_export() {
+    local port
+    local password
+    local ip
+    local alias_enc
+    local link
+
+    [ -f "${ANYTLS_CONFIG}" ] || die "AnyTLS config not found: ${ANYTLS_CONFIG}"
+
+    port="$(anytls_config_port)"
+    password="$(anytls_config_password)"
+    ip="$(anytls_public_ip)"
+    ip="${ip:-YOUR_SERVER_IP}"
+    alias_enc="$(urlencode "${ANYTLS_ALIAS}")"
+    link="anytls://${password}@${ip}:${port}/?insecure=1#${alias_enc}"
+
+    mkdir -p "${ANYTLS_DIR}"
+    cat > "${ANYTLS_CLIENT_FILE}" <<EOF
+AnyTLS client parameters
+Address: ${ip}
+Port: ${port}
+Password: ${password}
+Transport: tls
+Allow insecure / skip certificate verification: true
+URL: ${link}
+QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link}
+EOF
+
+    echo
+    ok "AnyTLS client parameters"
+    cat "${ANYTLS_CLIENT_FILE}"
+}
+
+anytls_install() {
+    local version
+    local port
+    local password
+
+    require_root
+
+    anytls_download_binary
+    version="${ANYTLS_DOWNLOADED_VERSION}"
+    port="$(anytls_prompt_port)"
+    password="$(anytls_password)"
+
+    anytls_write_service "${version}" "${port}" "${password}"
+    anytls_write_config "${port}" "${password}"
+    anytls_restart
+
+    if anytls_is_active; then
+        ok "AnyTLS is installed and running."
+        anytls_client_export
+    else
+        warn "AnyTLS did not become active. Check: journalctl -u ${ANYTLS_SERVICE_NAME} -e"
+    fi
+}
+
+anytls_update() {
+    local version
+    local port
+    local password
+
+    require_root
+    anytls_is_installed || die "AnyTLS is not installed."
+
+    port="$(anytls_config_port)"
+    password="$(anytls_config_password)"
+    port="${port:-$(anytls_random_port)}"
+    password="${password:-$(anytls_password)}"
+    anytls_download_binary
+    version="${ANYTLS_DOWNLOADED_VERSION}"
+
+    anytls_write_service "${version}" "${port}" "${password}"
+    anytls_write_config "${port}" "${password}"
+    anytls_restart
+    anytls_client_export
+}
+
+anytls_uninstall() {
+    local confirm
+
+    require_root
+    anytls_is_installed || die "AnyTLS is not installed."
+
+    read -rp "Uninstall AnyTLS and delete ${ANYTLS_DIR}? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+
+    systemctl disable --now "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
+    rm -f "${ANYTLS_SERVICE_FILE}"
+    rm -rf "${ANYTLS_DIR}"
+    systemctl daemon-reload 2>/dev/null || true
+    ok "AnyTLS uninstalled."
+}
+
+anytls_change_port() {
+    local port
+    local password
+
+    require_root
+    anytls_is_installed || die "AnyTLS is not installed."
+
+    port="$(anytls_prompt_port)"
+    password="$(anytls_config_password)"
+    password="${password:-$(anytls_password)}"
+
+    anytls_write_service "" "${port}" "${password}"
+    anytls_write_config "${port}" "${password}"
+    anytls_restart
+    anytls_client_export
+}
+
+anytls_change_password() {
+    local port
+    local password
+
+    require_root
+    anytls_is_installed || die "AnyTLS is not installed."
+
+    port="$(anytls_config_port)"
+    port="${port:-$(anytls_random_port)}"
+    password="$(anytls_password)"
+
+    anytls_write_service "" "${port}" "${password}"
+    anytls_write_config "${port}" "${password}"
+    anytls_restart
+    anytls_client_export
+}
+
+anytls_status() {
+    if anytls_is_installed; then
+        echo
+        ok "AnyTLS installed"
+        echo "Version: $(anytls_installed_version)"
+        echo "Port: $(anytls_config_port)"
+        if anytls_is_active; then
+            echo "Status: running"
+        else
+            echo "Status: stopped"
+        fi
+        systemctl --no-pager --full status "${ANYTLS_SERVICE_NAME}" | sed -n '1,8p' || true
+    else
+        warn "AnyTLS is not installed."
+    fi
+}
+
+anytls_start() {
+    require_root
+    anytls_is_installed || die "AnyTLS is not installed."
+    systemctl start "${ANYTLS_SERVICE_NAME}"
+    anytls_status
+}
+
+anytls_stop() {
+    require_root
+    anytls_is_installed || die "AnyTLS is not installed."
+    systemctl stop "${ANYTLS_SERVICE_NAME}"
+    anytls_status
+}
+
+anytls_logs() {
+    journalctl -u "${ANYTLS_SERVICE_NAME}" --no-pager -n 80 || true
+}
+
+anytls_menu() {
+    local choice
+
+    while true; do
+        clear
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}        AnyTLS Manager${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo "1. Install / reinstall AnyTLS"
+        echo "2. Update AnyTLS"
+        echo "3. Show client config"
+        echo "4. Change port"
+        echo "5. Change password"
+        echo "6. Show service status"
+        echo "7. Start service"
+        echo "8. Stop service"
+        echo "9. Show logs"
+        echo "10. Uninstall AnyTLS"
+        echo "0. Back"
+        echo -e "${CYAN}============================================${RESET}"
+        read -rp "Select [0-10]: " choice
+        case "${choice}" in
+            1) anytls_install ;;
+            2) anytls_update ;;
+            3) anytls_client_export ;;
+            4) anytls_change_port ;;
+            5) anytls_change_password ;;
+            6) anytls_status ;;
+            7) anytls_start ;;
+            8) anytls_stop ;;
+            9) anytls_logs ;;
+            10) anytls_uninstall ;;
+            0) return 0 ;;
+            *) err "Invalid option." ;;
+        esac
+        echo
+        read -rp "Press Enter to return to the AnyTLS menu..." _
+    done
+}
+
+deploy_snell_and_anytls() {
+    require_root
+    info "Step 1/2: Snell installation"
+    install_snell
+    echo
+    info "Step 2/2: AnyTLS installation"
+    anytls_install
+}
+
+deploy_bbr_snell_anytls() {
+    require_root
+    info "Step 1/3: Enable BBR"
+    enable_bbr
+    echo
+    info "Step 2/3: Snell installation"
+    install_snell
+    echo
+    info "Step 3/3: AnyTLS installation"
+    anytls_install
 }
 
 add_user() {
@@ -542,26 +1121,30 @@ Security notes:
 - This script does not auto-update itself.
 - This script does not upload server information, config, ports, or PSKs.
 - Snell binaries are downloaded only from https://dl.nssurge.com/snell/.
+- AnyTLS binaries are downloaded only from https://github.com/anytls/anytls-go/releases.
 - BBR is enabled locally through sysctl and modprobe only; no remote BBR script is used.
+- Features from third-party scripts were reimplemented locally instead of being pasted as remote-execution code.
 - Do not publish /etc/snell/users/*.conf because those files contain PSKs.
+- Do not publish /etc/AnyTLS/config.yaml because it contains the AnyTLS password.
 EOF
 }
 
 show_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}        Snell Manager v${SCRIPT_VERSION}${RESET}"
+    echo -e "${CYAN}        Snell + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}        githubh01/snell.sh${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo "1. Install Snell"
-    echo "2. Uninstall Snell"
-    echo "3. Show config"
-    echo "4. Restart service"
-    echo "5. Update Snell binary"
-    echo "6. Show service status"
-    echo "7. User config management"
-    echo "8. Enable BBR"
-    echo "9. Security notes"
+    echo "1. Snell management"
+    echo "2. AnyTLS management"
+    echo "3. Enable BBR"
+    echo "4. Deploy Snell + AnyTLS"
+    echo "5. Enable BBR + Deploy Snell + AnyTLS"
+    echo "6. Show Snell config"
+    echo "7. Show AnyTLS config"
+    echo "8. Show Snell status"
+    echo "9. Show AnyTLS status"
+    echo "10. Security notes"
     echo "0. Exit"
     echo -e "${CYAN}============================================${RESET}"
 }
@@ -571,17 +1154,18 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-9]: " choice
+        read -rp "Select [0-10]: " choice
         case "${choice}" in
-            1) install_snell ;;
-            2) uninstall_snell ;;
-            3) show_config ;;
-            4) restart_snell ;;
-            5) update_snell ;;
-            6) service_status ;;
-            7) user_menu ;;
-            8) enable_bbr ;;
-            9) security_note ;;
+            1) snell_menu ;;
+            2) anytls_menu ;;
+            3) enable_bbr ;;
+            4) deploy_snell_and_anytls ;;
+            5) deploy_bbr_snell_anytls ;;
+            6) show_config ;;
+            7) anytls_client_export ;;
+            8) service_status ;;
+            9) anytls_status ;;
+            10) security_note ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option." ;;
         esac
