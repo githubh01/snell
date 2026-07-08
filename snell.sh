@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -454,6 +454,28 @@ detect_public_ip() {
     curl -fsSL --connect-timeout 5 https://api.ipify.org 2>/dev/null || true
 }
 
+snell_installed_major() {
+    local output
+
+    if [ -x "${SNELL_BIN}" ]; then
+        output="$("${SNELL_BIN}" --v 2>&1 || true)"
+    elif has_command snell-server; then
+        output="$(snell-server --v 2>&1 || true)"
+    else
+        output=""
+    fi
+
+    if echo "${output}" | grep -qi 'v6'; then
+        echo "v6"
+    elif echo "${output}" | grep -qi 'v5'; then
+        echo "v5"
+    elif echo "${output}" | grep -qi 'v4'; then
+        echo "v4"
+    else
+        echo "unknown"
+    fi
+}
+
 print_one_config() {
     local file="$1"
     local label="$2"
@@ -461,12 +483,14 @@ print_one_config() {
     local psk
     local dns
     local ip
+    local major
 
     port="$(extract_value listen "${file}" | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p')"
     psk="$(extract_value psk "${file}")"
     dns="$(extract_value dns "${file}")"
     ip="$(detect_public_ip)"
     ip="${ip:-YOUR_SERVER_IP}"
+    major="$(snell_installed_major)"
 
     echo
     ok "${label}"
@@ -474,9 +498,25 @@ print_one_config() {
     echo "Port: ${port}"
     echo "PSK: ${psk}"
     echo "DNS: ${dns}"
+    echo "Detected Snell server: ${major}"
     echo "Surge examples:"
-    echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 4, reuse = true, tfo = true"
-    echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true, tfo = true"
+    case "${major}" in
+        v4)
+            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 4, reuse = true, tfo = true"
+            ;;
+        v5)
+            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true, tfo = true"
+            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 6, reuse = true, tfo = true"
+            ;;
+        v6)
+            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 6, reuse = true, tfo = true"
+            ;;
+        *)
+            warn "Could not detect Snell server major version. Showing v5 and v6 examples by default."
+            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true, tfo = true"
+            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 6, reuse = true, tfo = true"
+            ;;
+    esac
 }
 
 show_config() {
@@ -1504,6 +1544,29 @@ deploy_bbr_snell_anytls() {
     anytls_install
 }
 
+restart_proxy_services() {
+    require_root
+
+    info "Restarting Snell and AnyTLS services only. BBR will not be restarted or changed."
+
+    if [ -f "${SERVICE_FILE}" ]; then
+        systemctl restart snell
+        ok "Snell service restarted."
+    else
+        warn "Snell service file not found; skipped."
+    fi
+
+    if [ -f "${ANYTLS_SERVICE_FILE}" ]; then
+        systemctl restart "${ANYTLS_SERVICE_NAME}"
+        ok "AnyTLS service restarted."
+    else
+        warn "AnyTLS service file not found; skipped."
+    fi
+
+    echo
+    show_bbr_status
+}
+
 add_user() {
     local port
     local dns
@@ -1592,12 +1655,13 @@ show_menu() {
     echo "3. Enable BBR"
     echo "4. Deploy Snell + AnyTLS"
     echo "5. Enable BBR + Deploy Snell + AnyTLS"
-    echo "6. Certificate + Secure AnyTLS"
-    echo "7. Show Snell config"
-    echo "8. Show AnyTLS config"
-    echo "9. Show Snell status"
-    echo "10. Show AnyTLS status"
-    echo "11. Security notes"
+    echo "6. Restart Snell + AnyTLS services"
+    echo "7. Certificate + Secure AnyTLS"
+    echo "8. Show Snell config"
+    echo "9. Show AnyTLS config"
+    echo "10. Show Snell status"
+    echo "11. Show AnyTLS status"
+    echo "12. Security notes"
     echo "0. Exit"
     echo -e "${CYAN}============================================${RESET}"
 }
@@ -1607,19 +1671,20 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-11]: " choice
+        read -rp "Select [0-12]: " choice
         case "${choice}" in
             1) snell_menu ;;
             2) anytls_menu ;;
             3) enable_bbr ;;
             4) deploy_snell_and_anytls ;;
             5) deploy_bbr_snell_anytls ;;
-            6) anytls_install_with_acme_cert ;;
-            7) show_config ;;
-            8) anytls_client_export ;;
-            9) service_status ;;
-            10) anytls_status ;;
-            11) security_note ;;
+            6) restart_proxy_services ;;
+            7) anytls_install_with_acme_cert ;;
+            8) show_config ;;
+            9) anytls_client_export ;;
+            10) service_status ;;
+            11) anytls_status ;;
+            12) security_note ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option." ;;
         esac
