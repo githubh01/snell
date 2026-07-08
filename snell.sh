@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,8 +19,7 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 INSTALL_DIR="/usr/local/bin"
-SHORTCUT_PRIMARY="/usr/local/bin/snell-menu"
-SHORTCUT_ALIAS="/usr/local/bin/sat"
+SHORTCUT_PRIMARY="/usr/local/bin/hardy"
 SNELL_BIN="${INSTALL_DIR}/snell-server"
 SNELL_DIR="/etc/snell"
 USERS_DIR="${SNELL_DIR}/users"
@@ -60,17 +59,47 @@ has_command() {
 
 install_menu_shortcut() {
     local script_path
+    local candidates
 
     [ "$(id -u)" = "0" ] || return 0
     script_path="$(readlink -f "$0" 2>/dev/null || true)"
-    [ -n "${script_path}" ] || return 0
-    [ -f "${script_path}" ] || return 0
     [ "${script_path}" = "${SHORTCUT_PRIMARY}" ] && return 0
+
+    candidates="${script_path}
+$(pwd 2>/dev/null)/snell.sh
+$(pwd 2>/dev/null)/hardy.sh
+/root/snell.sh
+/root/hardy.sh"
+
+    script_path=""
+    while IFS= read -r candidate; do
+        [ -n "${candidate}" ] || continue
+        if [ -f "${candidate}" ] && grep -q 'Snell + AnyTLS Manager' "${candidate}" 2>/dev/null; then
+            script_path="${candidate}"
+            break
+        fi
+    done <<EOF
+${candidates}
+EOF
+
+    if [ -z "${script_path}" ]; then
+        warn "Could not install shortcut: script file was not found. Save this script as /root/snell.sh and run it once, then command 'hardy' will work."
+        return 1
+    fi
 
     mkdir -p "${INSTALL_DIR}"
     if install -m 0755 "${script_path}" "${SHORTCUT_PRIMARY}" 2>/dev/null; then
-        ln -sf "${SHORTCUT_PRIMARY}" "${SHORTCUT_ALIAS}" 2>/dev/null || true
+        ok "Shortcut installed: hardy"
+        return 0
     fi
+
+    warn "Could not install shortcut to ${SHORTCUT_PRIMARY}."
+    return 1
+}
+
+repair_hardy_shortcut() {
+    require_root
+    install_menu_shortcut
 }
 
 wait_for_apt() {
@@ -1695,7 +1724,7 @@ show_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}        Snell + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}        githubh01/snell.sh${RESET}"
-    echo -e "${CYAN}        Shortcuts: snell-menu / sat${RESET}"
+    echo -e "${CYAN}        Shortcut: hardy${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo "1. Snell management"
     echo "2. AnyTLS management"
@@ -1708,7 +1737,8 @@ show_menu() {
     echo "9. Show AnyTLS config"
     echo "10. Show Snell status"
     echo "11. Show AnyTLS status"
-    echo "12. Security notes"
+    echo "12. Install / repair hardy shortcut"
+    echo "13. Security notes"
     echo "0. Exit"
     echo -e "${CYAN}============================================${RESET}"
 }
@@ -1720,7 +1750,7 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-12]: " choice
+        read -rp "Select [0-13]: " choice
         case "${choice}" in
             1) snell_menu ;;
             2) anytls_menu ;;
@@ -1733,7 +1763,8 @@ main() {
             9) anytls_client_export ;;
             10) service_status ;;
             11) anytls_status ;;
-            12) security_note ;;
+            12) repair_hardy_shortcut ;;
+            13) security_note ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option." ;;
         esac
