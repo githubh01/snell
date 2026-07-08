@@ -756,7 +756,16 @@ enable_bbr() {
         warn "Could not load tcp_bbr with modprobe. The kernel may not support BBR, or it may already be built in."
     fi
 
-    cp -a "${conf}" "${conf}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    if [ -e "${conf}" ] && [ ! -f "${conf}" ]; then
+        die "${conf} exists but is not a regular file."
+    fi
+
+    if [ ! -e "${conf}" ]; then
+        : > "${conf}" || die "Cannot create ${conf}."
+        chmod 0644 "${conf}" 2>/dev/null || true
+    else
+        cp -a "${conf}" "${conf}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    fi
 
     sed -i '/^[[:space:]]*net.core.default_qdisc[[:space:]]*=/d' "${conf}"
     sed -i '/^[[:space:]]*net.ipv4.tcp_congestion_control[[:space:]]*=/d' "${conf}"
