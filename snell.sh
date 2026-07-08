@@ -57,9 +57,20 @@ has_command() {
 }
 
 wait_for_apt() {
+    local waited=0
+    local max_wait="${APT_LOCK_MAX_WAIT:-900}"
+
     while apt_is_busy; do
         warn "Waiting for another apt/dpkg process..."
+        if [ $((waited % 30)) -eq 0 ]; then
+            apt_lock_details
+        fi
+        if [ "${waited}" -ge "${max_wait}" ]; then
+            apt_lock_details
+            die "Timed out waiting for apt/dpkg lock after ${max_wait}s. Check the process above, or reboot if it is stale."
+        fi
         sleep 2
+        waited=$((waited + 2))
     done
 }
 
@@ -71,6 +82,19 @@ apt_is_busy() {
     fi
 
     ps -eo comm= 2>/dev/null | grep -Eq '^(apt|apt-get|dpkg|unattended-upgr)$'
+}
+
+apt_lock_details() {
+    echo "Current apt/dpkg holders:" >&2
+
+    if has_command fuser; then
+        fuser -v /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || true
+    fi
+
+    ps -eo pid,ppid,comm,args 2>/dev/null | awk '
+        NR == 1 { print; next }
+        $3 ~ /^(apt|apt-get|dpkg|unattended-upgr)$/ { print }
+    ' >&2 || true
 }
 
 run_apt_get() {
@@ -1094,11 +1118,11 @@ anytls_client_export() {
     local ip
     local domain
     local mode
-    local host
-    local insecure_param
+    local query
     local insecure_text
     local alias_enc
     local link
+    local link_enc
 
     [ -f "${ANYTLS_CONFIG}" ] || die "AnyTLS config not found: ${ANYTLS_CONFIG}"
 
@@ -1108,28 +1132,29 @@ anytls_client_export() {
     mode="$(anytls_config_mode)"
     ip="$(anytls_public_ip)"
     ip="${ip:-YOUR_SERVER_IP}"
-    host="${domain:-${ip}}"
-    insecure_param="/?insecure=1"
+    query="?allowInsecure=1&insecure=1"
     insecure_text="true"
     if [ "${mode}" = "sing-box-tls" ] && [ -n "${domain}" ]; then
-        insecure_param=""
+        query="?sni=${domain}&allowInsecure=0&insecure=0"
         insecure_text="false"
     fi
     alias_enc="$(urlencode "${ANYTLS_ALIAS}")"
-    link="anytls://${password}@${host}:${port}${insecure_param}#${alias_enc}"
+    link="anytls://${password}@${ip}:${port}${query}#${alias_enc}"
+    link_enc="$(urlencode "${link}")"
 
     mkdir -p "${ANYTLS_DIR}"
     cat > "${ANYTLS_CLIENT_FILE}" <<EOF
 AnyTLS client parameters
 Address: ${ip}
 Domain: ${domain:-none}
+SNI: ${domain:-none}
 Port: ${port}
 Password: ${password}
 Transport: tls
 Allow insecure / skip certificate verification: ${insecure_text}
 Mode: ${mode:-anytls-go}
 URL: ${link}
-QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link}
+QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link_enc}
 EOF
 
     echo
