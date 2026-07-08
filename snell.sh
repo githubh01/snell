@@ -36,6 +36,11 @@ ANYTLS_SERVICE_FILE="/etc/systemd/system/${ANYTLS_SERVICE_NAME}"
 ANYTLS_TZ="Asia/Shanghai"
 ANYTLS_ALIAS="AnyTLS"
 ANYTLS_DOWNLOADED_VERSION=""
+ANYTLS_CERT_DIR="${ANYTLS_DIR}/certs"
+ANYTLS_SING_BOX_BIN="${ANYTLS_DIR}/sing-box"
+ANYTLS_SING_BOX_CONFIG="${ANYTLS_DIR}/sing-box-anytls.json"
+ANYTLS_DOMAIN_FILE="${ANYTLS_DIR}/domain"
+SING_BOX_DOWNLOADED_VERSION=""
 
 info() { echo -e "${CYAN}$*${RESET}"; }
 ok() { echo -e "${GREEN}$*${RESET}"; }
@@ -77,7 +82,7 @@ install_packages() {
     local missing=()
     local cmd
 
-    for cmd in curl unzip awk sed grep systemctl; do
+    for cmd in curl unzip tar awk sed grep systemctl; do
         if ! has_command "$cmd"; then
             missing+=("$cmd")
         fi
@@ -89,15 +94,15 @@ install_packages() {
 
     if has_command apt-get; then
         run_apt_get update
-        run_apt_get install -y curl unzip gawk sed grep systemd procps
+        run_apt_get install -y curl unzip tar gawk sed grep systemd procps
     elif has_command dnf; then
-        dnf install -y curl unzip gawk sed grep systemd
+        dnf install -y curl unzip tar gawk sed grep systemd
     elif has_command yum; then
-        yum install -y curl unzip gawk sed grep systemd
+        yum install -y curl unzip tar gawk sed grep systemd
     elif has_command apk; then
-        apk add --no-cache curl unzip gawk sed grep
+        apk add --no-cache curl unzip tar gawk sed grep
     else
-        die "Unsupported package manager. Please install curl, unzip, awk, sed, and grep manually."
+        die "Unsupported package manager. Please install curl, unzip, tar, awk, sed, and grep manually."
     fi
 }
 
@@ -112,6 +117,27 @@ install_anytls_packages() {
         yum install -y ca-certificates
     elif has_command apk; then
         apk add --no-cache ca-certificates
+    fi
+}
+
+install_acme_packages() {
+    install_anytls_packages
+
+    if has_command certbot; then
+        return 0
+    fi
+
+    if has_command apt-get; then
+        run_apt_get install -y certbot openssl
+    elif has_command dnf; then
+        dnf install -y certbot openssl
+    elif has_command yum; then
+        yum install -y epel-release || true
+        yum install -y certbot openssl
+    elif has_command apk; then
+        apk add --no-cache certbot openssl
+    else
+        die "Unsupported package manager. Please install certbot manually."
     fi
 }
 
@@ -632,6 +658,57 @@ anytls_arch() {
     esac
 }
 
+sing_box_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7) echo "armv7" ;;
+        *) die "sing-box architecture is unsupported by this script: $(uname -m)" ;;
+    esac
+}
+
+sing_box_latest_version() {
+    local version
+
+    version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+    [ -n "${version}" ] || die "Could not get latest sing-box version from GitHub."
+    echo "${version}"
+}
+
+install_sing_box_binary() {
+    local version
+    local version_num
+    local arch
+    local url
+    local name
+    local tmpdir
+
+    install_anytls_packages
+    mkdir -p "${ANYTLS_DIR}"
+
+    version="$(sing_box_latest_version)"
+    version_num="${version#v}"
+    arch="$(sing_box_arch)"
+    name="sing-box-${version_num}-linux-${arch}"
+    url="https://github.com/SagerNet/sing-box/releases/download/${version}/${name}.tar.gz"
+    tmpdir="$(mktemp -d)"
+
+    info "Downloading sing-box ${version} (${arch})..."
+    warn "Source: ${url}"
+
+    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/sing-box.tar.gz"
+    tar xzf "${tmpdir}/sing-box.tar.gz" -C "${tmpdir}"
+
+    [ -f "${tmpdir}/${name}/sing-box" ] || {
+        rm -rf "${tmpdir}"
+        die "sing-box binary was not found in the downloaded archive."
+    }
+
+    install -m 0755 "${tmpdir}/${name}/sing-box" "${ANYTLS_SING_BOX_BIN}"
+    rm -rf "${tmpdir}"
+    SING_BOX_DOWNLOADED_VERSION="${version}"
+}
+
 anytls_random_port() {
     local port
 
@@ -757,17 +834,50 @@ anytls_config_password() {
     sed -nE 's/^[[:space:]]*password:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
 }
 
+anytls_config_domain() {
+    [ -f "${ANYTLS_CONFIG}" ] || return 0
+    sed -nE 's/^[[:space:]]*domain:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+}
+
+anytls_config_cert_path() {
+    [ -f "${ANYTLS_CONFIG}" ] || return 0
+    sed -nE 's/^[[:space:]]*certificate_path:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+}
+
+anytls_config_key_path() {
+    [ -f "${ANYTLS_CONFIG}" ] || return 0
+    sed -nE 's/^[[:space:]]*key_path:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+}
+
+anytls_config_mode() {
+    [ -f "${ANYTLS_CONFIG}" ] || return 0
+    sed -nE 's/^[[:space:]]*mode:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+}
+
 anytls_write_config() {
     local port="$1"
     local password="$2"
+    local domain="${3:-}"
+    local cert_path="${4:-}"
+    local key_path="${5:-}"
+    local mode="${6:-anytls-go}"
 
     mkdir -p "${ANYTLS_DIR}"
     cat > "${ANYTLS_CONFIG}" <<EOF
+mode: ${mode}
 listen: :${port}
 auth:
   type: password
   password: ${password}
 EOF
+    if [ -n "${domain}" ]; then
+        cat >> "${ANYTLS_CONFIG}" <<EOF
+domain: ${domain}
+certificate_path: ${cert_path}
+key_path: ${key_path}
+EOF
+        echo "${domain}" > "${ANYTLS_DOMAIN_FILE}"
+    fi
     chmod 600 "${ANYTLS_CONFIG}"
 }
 
@@ -803,6 +913,142 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+anytls_write_sing_box_config() {
+    local port="$1"
+    local password="$2"
+    local domain="$3"
+    local cert_path="$4"
+    local key_path="$5"
+
+    mkdir -p "${ANYTLS_DIR}"
+    cat > "${ANYTLS_SING_BOX_CONFIG}" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${port},
+      "users": [
+        {
+          "name": "main",
+          "password": "${password}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${domain}",
+        "certificate_path": "${cert_path}",
+        "key_path": "${key_path}"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    chmod 600 "${ANYTLS_SING_BOX_CONFIG}"
+}
+
+anytls_write_sing_box_service() {
+    local version="$1"
+
+    version="${version:-$(anytls_installed_version)}"
+    version="${version#sing-box }"
+    version="${version:-unknown}"
+
+    cat > "${ANYTLS_SERVICE_FILE}" <<EOF
+[Unit]
+Description=AnyTLS Server Service via sing-box
+Documentation=https://sing-box.sagernet.org/configuration/inbound/anytls/
+After=network-online.target
+Wants=network-online.target
+X-AT-Version=sing-box ${version}
+
+[Service]
+Type=simple
+User=root
+Environment=TZ=${ANYTLS_TZ}
+ExecStart=${ANYTLS_SING_BOX_BIN} run -c ${ANYTLS_SING_BOX_CONFIG}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+certbot_issue_standalone() {
+    local domain="$1"
+    local email="$2"
+    local staging="${3:-false}"
+    local staging_arg=""
+
+    install_acme_packages
+
+    if is_port_used 80; then
+        die "Port 80 is in use. Stop the service using port 80, then run certificate issuance again."
+    fi
+
+    if [ "${staging}" = "true" ]; then
+        staging_arg="--test-cert"
+    fi
+
+    certbot certonly --standalone --non-interactive --agree-tos \
+        --preferred-challenges http \
+        --email "${email}" \
+        -d "${domain}" \
+        ${staging_arg}
+}
+
+copy_letsencrypt_cert_for_anytls() {
+    local domain="$1"
+    local src_dir="/etc/letsencrypt/live/${domain}"
+    local cert_path="${ANYTLS_CERT_DIR}/${domain}.fullchain.pem"
+    local key_path="${ANYTLS_CERT_DIR}/${domain}.privkey.pem"
+
+    [ -f "${src_dir}/fullchain.pem" ] || die "Certificate not found: ${src_dir}/fullchain.pem"
+    [ -f "${src_dir}/privkey.pem" ] || die "Private key not found: ${src_dir}/privkey.pem"
+
+    mkdir -p "${ANYTLS_CERT_DIR}"
+    cp -L "${src_dir}/fullchain.pem" "${cert_path}"
+    cp -L "${src_dir}/privkey.pem" "${key_path}"
+    chmod 600 "${cert_path}" "${key_path}"
+
+    echo "${cert_path}|${key_path}"
+}
+
+install_cert_renew_hook() {
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    local hook_file="${hook_dir}/anytls-sing-box.sh"
+
+    mkdir -p "${hook_dir}"
+    cat > "${hook_file}" <<EOF
+#!/usr/bin/env sh
+set -eu
+DOMAIN="\$(cat "${ANYTLS_DOMAIN_FILE}" 2>/dev/null || true)"
+[ -n "\${DOMAIN}" ] || exit 0
+[ -f "/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem" ] || exit 0
+mkdir -p "${ANYTLS_CERT_DIR}"
+cp -L "/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem" "${ANYTLS_CERT_DIR}/\${DOMAIN}.fullchain.pem"
+cp -L "/etc/letsencrypt/live/\${DOMAIN}/privkey.pem" "${ANYTLS_CERT_DIR}/\${DOMAIN}.privkey.pem"
+chmod 600 "${ANYTLS_CERT_DIR}/\${DOMAIN}.fullchain.pem" "${ANYTLS_CERT_DIR}/\${DOMAIN}.privkey.pem"
+systemctl restart "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
+EOF
+    chmod +x "${hook_file}"
 }
 
 anytls_download_binary() {
@@ -846,6 +1092,11 @@ anytls_client_export() {
     local port
     local password
     local ip
+    local domain
+    local mode
+    local host
+    local insecure_param
+    local insecure_text
     local alias_enc
     local link
 
@@ -853,19 +1104,30 @@ anytls_client_export() {
 
     port="$(anytls_config_port)"
     password="$(anytls_config_password)"
+    domain="$(anytls_config_domain)"
+    mode="$(anytls_config_mode)"
     ip="$(anytls_public_ip)"
     ip="${ip:-YOUR_SERVER_IP}"
+    host="${domain:-${ip}}"
+    insecure_param="/?insecure=1"
+    insecure_text="true"
+    if [ "${mode}" = "sing-box-tls" ] && [ -n "${domain}" ]; then
+        insecure_param=""
+        insecure_text="false"
+    fi
     alias_enc="$(urlencode "${ANYTLS_ALIAS}")"
-    link="anytls://${password}@${ip}:${port}/?insecure=1#${alias_enc}"
+    link="anytls://${password}@${host}:${port}${insecure_param}#${alias_enc}"
 
     mkdir -p "${ANYTLS_DIR}"
     cat > "${ANYTLS_CLIENT_FILE}" <<EOF
 AnyTLS client parameters
 Address: ${ip}
+Domain: ${domain:-none}
 Port: ${port}
 Password: ${password}
 Transport: tls
-Allow insecure / skip certificate verification: true
+Allow insecure / skip certificate verification: ${insecure_text}
+Mode: ${mode:-anytls-go}
 URL: ${link}
 QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link}
 EOF
@@ -903,20 +1165,135 @@ anytls_update() {
     local version
     local port
     local password
+    local mode
+    local domain
+    local cert_path
+    local key_path
 
     require_root
     anytls_is_installed || die "AnyTLS is not installed."
 
     port="$(anytls_config_port)"
     password="$(anytls_config_password)"
+    mode="$(anytls_config_mode)"
+    domain="$(anytls_config_domain)"
+    cert_path="$(anytls_config_cert_path)"
+    key_path="$(anytls_config_key_path)"
     port="${port:-$(anytls_random_port)}"
     password="${password:-$(anytls_password)}"
+
+    if [ "${mode}" = "sing-box-tls" ]; then
+        [ -n "${domain}" ] || die "AnyTLS TLS domain is missing."
+        [ -f "${cert_path}" ] || die "Certificate file is missing: ${cert_path}"
+        [ -f "${key_path}" ] || die "Key file is missing: ${key_path}"
+        install_sing_box_binary
+        version="${SING_BOX_DOWNLOADED_VERSION}"
+        anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
+        anytls_write_sing_box_service "${version}"
+        anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
+        anytls_restart
+        anytls_client_export
+        return 0
+    fi
+
     anytls_download_binary
     version="${ANYTLS_DOWNLOADED_VERSION}"
 
     anytls_write_service "${version}" "${port}" "${password}"
     anytls_write_config "${port}" "${password}"
     anytls_restart
+    anytls_client_export
+}
+
+anytls_install_with_acme_cert() {
+    local domain
+    local email
+    local staging_choice
+    local staging="false"
+    local cert_pair
+    local cert_path
+    local key_path
+    local version
+    local port
+    local password
+
+    require_root
+
+    echo
+    warn "This mode uses certbot standalone HTTP-01. Your domain must point to this VPS and port 80 must be reachable."
+    read -rp "Domain for AnyTLS certificate: " domain
+    [ -n "${domain}" ] || die "Domain is required."
+    read -rp "Email for Let's Encrypt notices: " email
+    [ -n "${email}" ] || die "Email is required."
+    read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
+    if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
+        staging="true"
+    fi
+
+    certbot_issue_standalone "${domain}" "${email}" "${staging}"
+    cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"
+    cert_path="${cert_pair%%|*}"
+    key_path="${cert_pair#*|}"
+    install_cert_renew_hook
+
+    install_sing_box_binary
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+    port="$(anytls_prompt_port)"
+    password="$(anytls_password)"
+
+    anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
+    anytls_write_sing_box_service "${version}"
+    anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
+    anytls_restart
+
+    if anytls_is_active; then
+        ok "Secure AnyTLS via sing-box is installed and running."
+        anytls_client_export
+    else
+        warn "AnyTLS did not become active. Check: journalctl -u ${ANYTLS_SERVICE_NAME} -e"
+    fi
+}
+
+anytls_apply_existing_cert() {
+    local domain
+    local port
+    local password
+    local cert_pair
+    local cert_path
+    local key_path
+    local version
+
+    require_root
+
+    read -rp "Existing Let's Encrypt domain to apply: " domain
+    [ -n "${domain}" ] || die "Domain is required."
+
+    cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"
+    cert_path="${cert_pair%%|*}"
+    key_path="${cert_pair#*|}"
+    install_cert_renew_hook
+
+    install_sing_box_binary
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+    port="$(anytls_config_port)"
+    password="$(anytls_config_password)"
+    port="${port:-$(anytls_prompt_port)}"
+    password="${password:-$(anytls_password)}"
+
+    anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
+    anytls_write_sing_box_service "${version}"
+    anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
+    anytls_restart
+    anytls_client_export
+}
+
+renew_anytls_certificate() {
+    require_root
+    install_acme_packages
+    certbot renew
+    if anytls_is_installed; then
+        systemctl restart "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
+    fi
     anytls_client_export
 }
 
@@ -939,6 +1316,10 @@ anytls_uninstall() {
 anytls_change_port() {
     local port
     local password
+    local mode
+    local domain
+    local cert_path
+    local key_path
 
     require_root
     anytls_is_installed || die "AnyTLS is not installed."
@@ -946,9 +1327,19 @@ anytls_change_port() {
     port="$(anytls_prompt_port)"
     password="$(anytls_config_password)"
     password="${password:-$(anytls_password)}"
+    mode="$(anytls_config_mode)"
+    domain="$(anytls_config_domain)"
+    cert_path="$(anytls_config_cert_path)"
+    key_path="$(anytls_config_key_path)"
 
-    anytls_write_service "" "${port}" "${password}"
-    anytls_write_config "${port}" "${password}"
+    if [ "${mode}" = "sing-box-tls" ]; then
+        anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
+        anytls_write_sing_box_service ""
+        anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
+    else
+        anytls_write_service "" "${port}" "${password}"
+        anytls_write_config "${port}" "${password}"
+    fi
     anytls_restart
     anytls_client_export
 }
@@ -956,6 +1347,10 @@ anytls_change_port() {
 anytls_change_password() {
     local port
     local password
+    local mode
+    local domain
+    local cert_path
+    local key_path
 
     require_root
     anytls_is_installed || die "AnyTLS is not installed."
@@ -963,9 +1358,19 @@ anytls_change_password() {
     port="$(anytls_config_port)"
     port="${port:-$(anytls_random_port)}"
     password="$(anytls_password)"
+    mode="$(anytls_config_mode)"
+    domain="$(anytls_config_domain)"
+    cert_path="$(anytls_config_cert_path)"
+    key_path="$(anytls_config_key_path)"
 
-    anytls_write_service "" "${port}" "${password}"
-    anytls_write_config "${port}" "${password}"
+    if [ "${mode}" = "sing-box-tls" ]; then
+        anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
+        anytls_write_sing_box_service ""
+        anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
+    else
+        anytls_write_service "" "${port}" "${password}"
+        anytls_write_config "${port}" "${password}"
+    fi
     anytls_restart
     anytls_client_export
 }
@@ -975,6 +1380,8 @@ anytls_status() {
         echo
         ok "AnyTLS installed"
         echo "Version: $(anytls_installed_version)"
+        echo "Mode: $(anytls_config_mode)"
+        echo "Domain: $(anytls_config_domain)"
         echo "Port: $(anytls_config_port)"
         if anytls_is_active; then
             echo "Status: running"
@@ -1019,13 +1426,16 @@ anytls_menu() {
         echo "4. Change port"
         echo "5. Change password"
         echo "6. Show service status"
-        echo "7. Start service"
-        echo "8. Stop service"
-        echo "9. Show logs"
-        echo "10. Uninstall AnyTLS"
+        echo "7. One-click certificate + secure AnyTLS"
+        echo "8. Apply existing Let's Encrypt cert to AnyTLS"
+        echo "9. Renew certificate"
+        echo "10. Start service"
+        echo "11. Stop service"
+        echo "12. Show logs"
+        echo "13. Uninstall AnyTLS"
         echo "0. Back"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-10]: " choice
+        read -rp "Select [0-13]: " choice
         case "${choice}" in
             1) anytls_install ;;
             2) anytls_update ;;
@@ -1033,10 +1443,13 @@ anytls_menu() {
             4) anytls_change_port ;;
             5) anytls_change_password ;;
             6) anytls_status ;;
-            7) anytls_start ;;
-            8) anytls_stop ;;
-            9) anytls_logs ;;
-            10) anytls_uninstall ;;
+            7) anytls_install_with_acme_cert ;;
+            8) anytls_apply_existing_cert ;;
+            9) renew_anytls_certificate ;;
+            10) anytls_start ;;
+            11) anytls_stop ;;
+            12) anytls_logs ;;
+            13) anytls_uninstall ;;
             0) return 0 ;;
             *) err "Invalid option." ;;
         esac
@@ -1135,6 +1548,7 @@ Security notes:
 - This script does not upload server information, config, ports, or PSKs.
 - Snell binaries are downloaded only from https://dl.nssurge.com/snell/.
 - AnyTLS binaries are downloaded only from https://github.com/anytls/anytls-go/releases.
+- Secure AnyTLS with real certificates uses system certbot and official sing-box releases.
 - BBR is enabled locally through sysctl and modprobe only; no remote BBR script is used.
 - Features from third-party scripts were reimplemented locally instead of being pasted as remote-execution code.
 - Do not publish /etc/snell/users/*.conf because those files contain PSKs.
@@ -1153,11 +1567,12 @@ show_menu() {
     echo "3. Enable BBR"
     echo "4. Deploy Snell + AnyTLS"
     echo "5. Enable BBR + Deploy Snell + AnyTLS"
-    echo "6. Show Snell config"
-    echo "7. Show AnyTLS config"
-    echo "8. Show Snell status"
-    echo "9. Show AnyTLS status"
-    echo "10. Security notes"
+    echo "6. Certificate + Secure AnyTLS"
+    echo "7. Show Snell config"
+    echo "8. Show AnyTLS config"
+    echo "9. Show Snell status"
+    echo "10. Show AnyTLS status"
+    echo "11. Security notes"
     echo "0. Exit"
     echo -e "${CYAN}============================================${RESET}"
 }
@@ -1167,18 +1582,19 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-10]: " choice
+        read -rp "Select [0-11]: " choice
         case "${choice}" in
             1) snell_menu ;;
             2) anytls_menu ;;
             3) enable_bbr ;;
             4) deploy_snell_and_anytls ;;
             5) deploy_bbr_snell_anytls ;;
-            6) show_config ;;
-            7) anytls_client_export ;;
-            8) service_status ;;
-            9) anytls_status ;;
-            10) security_note ;;
+            6) anytls_install_with_acme_cert ;;
+            7) show_config ;;
+            8) anytls_client_export ;;
+            9) service_status ;;
+            10) anytls_status ;;
+            11) security_note ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option." ;;
         esac
