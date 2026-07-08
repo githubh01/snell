@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -41,6 +41,7 @@ ANYTLS_CERT_DIR="${ANYTLS_DIR}/certs"
 ANYTLS_SING_BOX_BIN="${ANYTLS_DIR}/sing-box"
 ANYTLS_SING_BOX_CONFIG="${ANYTLS_DIR}/sing-box-anytls.json"
 ANYTLS_DOMAIN_FILE="${ANYTLS_DIR}/domain"
+CF_CERTBOT_CREDENTIALS="/etc/letsencrypt/cloudflare.ini"
 SING_BOX_DOWNLOADED_VERSION=""
 
 info() { echo -e "${CYAN}$*${RESET}"; }
@@ -100,6 +101,91 @@ EOF
 repair_hardy_shortcut() {
     require_root
     install_menu_shortcut
+}
+
+cleanup_old_script_files() {
+    local candidates
+    local candidate
+    local resolved
+    local current_path
+    local shortcut_path
+    local root_script_path
+    local tmp_list
+    local confirm
+    local removed=0
+
+    require_root
+
+    current_path="$(readlink -f "$0" 2>/dev/null || true)"
+    shortcut_path="$(readlink -f "${SHORTCUT_PRIMARY}" 2>/dev/null || true)"
+    root_script_path="$(readlink -f /root/snell.sh 2>/dev/null || true)"
+    tmp_list="$(mktemp)"
+
+    candidates="/usr/local/bin/sat
+/usr/local/bin/snell-menu
+/usr/local/bin/hardy.sh
+/root/hardy.sh
+/root/sat
+/root/snell-menu
+/root/snell.old.sh
+/root/snell.sh.old
+/root/snell.sh.bak
+/root/snell.sh.backup"
+
+    while IFS= read -r candidate; do
+        [ -n "${candidate}" ] || continue
+        [ -e "${candidate}" ] || continue
+        resolved="$(readlink -f "${candidate}" 2>/dev/null || printf '%s' "${candidate}")"
+
+        if [ -n "${current_path}" ] && [ "${resolved}" = "${current_path}" ]; then
+            continue
+        fi
+        if [ -n "${shortcut_path}" ] && [ "${resolved}" = "${shortcut_path}" ]; then
+            continue
+        fi
+        if [ -n "${root_script_path}" ] && [ "${resolved}" = "${root_script_path}" ]; then
+            continue
+        fi
+
+        if [ -f "${candidate}" ] && ! grep -Eq 'Snell \+ AnyTLS Manager|Snell management script|githubh01/snell|snell-menu|sat' "${candidate}" 2>/dev/null; then
+            warn "Skipped unrelated file: ${candidate}"
+            continue
+        fi
+
+        printf '%s\n' "${candidate}" >> "${tmp_list}"
+    done <<EOF
+${candidates}
+EOF
+
+    if [ ! -s "${tmp_list}" ]; then
+        rm -f "${tmp_list}"
+        ok "No old script files or legacy shortcuts were found."
+        return 0
+    fi
+
+    echo
+    warn "Old script files / legacy shortcuts found:"
+    cat "${tmp_list}"
+    echo
+    warn "This will not remove Snell, AnyTLS, certificates, configs, /root/snell.sh, or the hardy shortcut."
+    read -rp "Delete the listed old script files now? [y/N]: " confirm
+    if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+        rm -f "${tmp_list}"
+        return 0
+    fi
+
+    while IFS= read -r candidate; do
+        [ -n "${candidate}" ] || continue
+        if rm -f -- "${candidate}" 2>/dev/null; then
+            ok "Removed: ${candidate}"
+            removed=$((removed + 1))
+        else
+            warn "Could not remove: ${candidate}"
+        fi
+    done < "${tmp_list}"
+
+    rm -f "${tmp_list}"
+    ok "Cleanup completed. Removed ${removed} old file(s)."
 }
 
 wait_for_apt() {
@@ -209,6 +295,33 @@ install_acme_packages() {
     else
         die "Unsupported package manager. Please install certbot manually."
     fi
+}
+
+certbot_has_cloudflare_plugin() {
+    certbot plugins 2>/dev/null | grep -q 'dns-cloudflare'
+}
+
+install_cloudflare_acme_packages() {
+    install_acme_packages
+
+    if certbot_has_cloudflare_plugin; then
+        return 0
+    fi
+
+    if has_command apt-get; then
+        run_apt_get install -y python3-certbot-dns-cloudflare
+    elif has_command dnf; then
+        dnf install -y python3-certbot-dns-cloudflare || dnf install -y certbot-dns-cloudflare
+    elif has_command yum; then
+        yum install -y epel-release || true
+        yum install -y python3-certbot-dns-cloudflare || yum install -y certbot-dns-cloudflare
+    elif has_command apk; then
+        apk add --no-cache py3-certbot-dns-cloudflare || apk add --no-cache certbot-dns-cloudflare
+    else
+        die "Unsupported package manager. Please install certbot-dns-cloudflare manually."
+    fi
+
+    certbot_has_cloudflare_plugin || die "certbot DNS Cloudflare plugin is not available after installation."
 }
 
 ensure_service_user() {
@@ -1163,6 +1276,47 @@ certbot_issue_standalone() {
         ${staging_arg}
 }
 
+certbot_issue_cloudflare() {
+    local domain="$1"
+    local email="$2"
+    local token="$3"
+    local staging="${4:-false}"
+    local propagation="${5:-60}"
+    local staging_args=()
+    local account_args=()
+
+    install_cloudflare_acme_packages
+
+    mkdir -p "$(dirname "${CF_CERTBOT_CREDENTIALS}")"
+    if [ -n "${token}" ]; then
+        cat > "${CF_CERTBOT_CREDENTIALS}" <<EOF
+dns_cloudflare_api_token = ${token}
+EOF
+        chmod 600 "${CF_CERTBOT_CREDENTIALS}"
+    fi
+
+    [ -f "${CF_CERTBOT_CREDENTIALS}" ] || die "Cloudflare credentials file not found: ${CF_CERTBOT_CREDENTIALS}"
+    chmod 600 "${CF_CERTBOT_CREDENTIALS}" 2>/dev/null || true
+
+    if [ "${staging}" = "true" ]; then
+        staging_args=(--test-cert)
+    fi
+
+    if [ -n "${email}" ]; then
+        account_args=(--email "${email}")
+    else
+        account_args=(--register-unsafely-without-email)
+    fi
+
+    certbot certonly --dns-cloudflare \
+        --dns-cloudflare-credentials "${CF_CERTBOT_CREDENTIALS}" \
+        --dns-cloudflare-propagation-seconds "${propagation}" \
+        --non-interactive --agree-tos \
+        "${account_args[@]}" \
+        -d "${domain}" \
+        "${staging_args[@]}"
+}
+
 copy_letsencrypt_cert_for_anytls() {
     local domain="$1"
     local src_dir="/etc/letsencrypt/live/${domain}"
@@ -1403,6 +1557,68 @@ anytls_install_with_acme_cert() {
     fi
 }
 
+anytls_install_with_cloudflare_cert() {
+    local domain
+    local email
+    local token
+    local propagation
+    local staging_choice
+    local staging="false"
+    local cert_pair
+    local cert_path
+    local key_path
+    local version
+    local port
+    local password
+
+    require_root
+
+    echo
+    warn "This mode uses Cloudflare DNS-01. Port 80 does not need to be reachable."
+    warn "Create a Cloudflare API token with Zone:DNS:Edit and Zone:Zone:Read for this domain."
+    read -rp "Domain for AnyTLS certificate: " domain
+    [ -n "${domain}" ] || die "Domain is required."
+    read -rp "Email for Let's Encrypt notices [Enter = no email]: " email
+    if [ -f "${CF_CERTBOT_CREDENTIALS}" ]; then
+        read -rsp "Cloudflare API token [Enter = reuse saved token]: " token
+        echo
+    else
+        read -rsp "Cloudflare API token: " token
+        echo
+        [ -n "${token}" ] || die "Cloudflare API token is required."
+    fi
+    read -rp "DNS propagation wait seconds [Enter = 60]: " propagation
+    propagation="${propagation:-60}"
+    [[ "${propagation}" =~ ^[0-9]+$ ]] || die "Invalid propagation seconds: ${propagation}"
+    read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
+    if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
+        staging="true"
+    fi
+
+    certbot_issue_cloudflare "${domain}" "${email}" "${token}" "${staging}" "${propagation}"
+    cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"
+    cert_path="${cert_pair%%|*}"
+    key_path="${cert_pair#*|}"
+    install_cert_renew_hook
+
+    install_sing_box_binary
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+    port="$(anytls_prompt_port)"
+    password="$(anytls_password)"
+
+    anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
+    anytls_write_sing_box_service "${version}"
+    anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
+    anytls_restart
+
+    if anytls_is_active; then
+        ok "Secure AnyTLS via Cloudflare DNS certificate is installed and running."
+        anytls_client_export
+    else
+        warn "AnyTLS did not become active. Check: journalctl -u ${ANYTLS_SERVICE_NAME} -e"
+    fi
+}
+
 anytls_apply_existing_cert() {
     local domain
     local port
@@ -1575,16 +1791,17 @@ anytls_menu() {
         echo "4. Change port"
         echo "5. Change password"
         echo "6. Show service status"
-        echo "7. One-click certificate + secure AnyTLS"
-        echo "8. Apply existing Let's Encrypt cert to AnyTLS"
-        echo "9. Renew certificate"
-        echo "10. Start service"
-        echo "11. Stop service"
-        echo "12. Show logs"
-        echo "13. Uninstall AnyTLS"
+        echo "7. HTTP-01 certificate + secure AnyTLS (requires port 80)"
+        echo "8. Cloudflare DNS certificate + secure AnyTLS (no port 80)"
+        echo "9. Apply existing Let's Encrypt cert to AnyTLS"
+        echo "10. Renew certificate"
+        echo "11. Start service"
+        echo "12. Stop service"
+        echo "13. Show logs"
+        echo "14. Uninstall AnyTLS"
         echo "0. Back"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-13]: " choice
+        read -rp "Select [0-14]: " choice
         case "${choice}" in
             1) anytls_install ;;
             2) anytls_update ;;
@@ -1593,12 +1810,13 @@ anytls_menu() {
             5) anytls_change_password ;;
             6) anytls_status ;;
             7) anytls_install_with_acme_cert ;;
-            8) anytls_apply_existing_cert ;;
-            9) renew_anytls_certificate ;;
-            10) anytls_start ;;
-            11) anytls_stop ;;
-            12) anytls_logs ;;
-            13) anytls_uninstall ;;
+            8) anytls_install_with_cloudflare_cert ;;
+            9) anytls_apply_existing_cert ;;
+            10) renew_anytls_certificate ;;
+            11) anytls_start ;;
+            12) anytls_stop ;;
+            13) anytls_logs ;;
+            14) anytls_uninstall ;;
             0) return 0 ;;
             *) err "Invalid option." ;;
         esac
@@ -1721,7 +1939,9 @@ Security notes:
 - Snell binaries are downloaded only from https://dl.nssurge.com/snell/.
 - AnyTLS binaries are downloaded only from https://github.com/anytls/anytls-go/releases.
 - Secure AnyTLS with real certificates uses system certbot and official sing-box releases.
+- Cloudflare DNS certificates store the API token at /etc/letsencrypt/cloudflare.ini with chmod 600.
 - BBR is enabled locally through sysctl and modprobe only; no remote BBR script is used.
+- Old script cleanup removes only legacy menu script files and shortcuts after confirmation.
 - Features from third-party scripts were reimplemented locally instead of being pasted as remote-execution code.
 - Do not publish /etc/snell/users/*.conf because those files contain PSKs.
 - Do not publish /etc/AnyTLS/config.yaml because it contains the AnyTLS password.
@@ -1739,15 +1959,17 @@ show_menu() {
     echo "2. AnyTLS management"
     echo "3. Enable BBR only"
     echo "4. Deploy Snell + AnyTLS (do not change BBR)"
-    echo "5. Enable BBR, then deploy Snell + certificate AnyTLS"
+    echo "5. Enable BBR, then deploy Snell + HTTP-01 certificate AnyTLS"
     echo "6. Restart Snell + AnyTLS services"
-    echo "7. Certificate + Secure AnyTLS"
-    echo "8. Show Snell config"
-    echo "9. Show AnyTLS config"
-    echo "10. Show Snell status"
-    echo "11. Show AnyTLS status"
-    echo "12. Install / repair hardy shortcut"
-    echo "13. Security notes"
+    echo "7. HTTP-01 certificate + Secure AnyTLS (requires port 80)"
+    echo "8. Cloudflare DNS certificate + Secure AnyTLS (no port 80)"
+    echo "9. Show Snell config"
+    echo "10. Show AnyTLS config"
+    echo "11. Show Snell status"
+    echo "12. Show AnyTLS status"
+    echo "13. Install / repair hardy shortcut"
+    echo "14. Clean old script files"
+    echo "15. Security notes"
     echo "0. Exit"
     echo -e "${CYAN}============================================${RESET}"
 }
@@ -1759,7 +1981,7 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-13]: " choice
+        read -rp "Select [0-15]: " choice
         case "${choice}" in
             1) snell_menu ;;
             2) anytls_menu ;;
@@ -1768,12 +1990,14 @@ main() {
             5) deploy_bbr_snell_anytls ;;
             6) restart_proxy_services ;;
             7) anytls_install_with_acme_cert ;;
-            8) show_config ;;
-            9) anytls_client_export ;;
-            10) service_status ;;
-            11) anytls_status ;;
-            12) repair_hardy_shortcut ;;
-            13) security_note ;;
+            8) anytls_install_with_cloudflare_cert ;;
+            9) show_config ;;
+            10) anytls_client_export ;;
+            11) service_status ;;
+            12) anytls_status ;;
+            13) repair_hardy_shortcut ;;
+            14) cleanup_old_script_files ;;
+            15) security_note ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option." ;;
         esac
