@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,6 +19,8 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 INSTALL_DIR="/usr/local/bin"
+SHORTCUT_PRIMARY="/usr/local/bin/snell-menu"
+SHORTCUT_ALIAS="/usr/local/bin/sat"
 SNELL_BIN="${INSTALL_DIR}/snell-server"
 SNELL_DIR="/etc/snell"
 USERS_DIR="${SNELL_DIR}/users"
@@ -54,6 +56,21 @@ require_root() {
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+install_menu_shortcut() {
+    local script_path
+
+    [ "$(id -u)" = "0" ] || return 0
+    script_path="$(readlink -f "$0" 2>/dev/null || true)"
+    [ -n "${script_path}" ] || return 0
+    [ -f "${script_path}" ] || return 0
+    [ "${script_path}" = "${SHORTCUT_PRIMARY}" ] && return 0
+
+    mkdir -p "${INSTALL_DIR}"
+    if install -m 0755 "${script_path}" "${SHORTCUT_PRIMARY}" 2>/dev/null; then
+        ln -sf "${SHORTCUT_PRIMARY}" "${SHORTCUT_ALIAS}" 2>/dev/null || true
+    fi
 }
 
 wait_for_apt() {
@@ -269,9 +286,18 @@ random_psk() {
 prompt_port() {
     local default_port="${1:-443}"
     local port
+    local prompt
 
     while true; do
-        read -rp "Listen port [default ${default_port}]: " port
+        if [ "${default_port}" = "random" ]; then
+            prompt="Listen port [Enter = random available port]: "
+        else
+            prompt="Listen port [default ${default_port}]: "
+        fi
+        read -rp "${prompt}" port
+        if [ -z "${port}" ] && [ "${default_port}" = "random" ]; then
+            port="$(random_available_port)"
+        fi
         port="${port:-${default_port}}"
         if [[ "${port}" =~ ^[0-9]+$ ]] && [ "${port}" -ge 1 ] && [ "${port}" -le 65535 ]; then
             echo "${port}"
@@ -387,7 +413,7 @@ install_snell() {
         fi
     fi
 
-    port="$(prompt_port 443)"
+    port="$(prompt_port random)"
     dns="$(prompt_dns)"
     psk="$(random_psk)"
     write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
@@ -678,14 +704,24 @@ show_bbr_status() {
 enable_bbr() {
     local confirm
     local conf="/etc/sysctl.conf"
+    local current_cc
+    local current_qdisc
 
     require_root
 
     show_bbr_status
     echo
-    warn "This will enable BBR by updating ${conf} and running sysctl -p."
-    read -rp "Enable BBR now? [y/N]: " confirm
-    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+    current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+    current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+    if [ "${current_cc}" = "bbr" ] && [ "${current_qdisc}" = "fq" ]; then
+        ok "BBR is already active. No runtime change is needed."
+        read -rp "Ensure BBR is persisted in ${conf}? [y/N]: " confirm
+        [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+    else
+        warn "This will enable BBR by updating ${conf} and running sysctl -p."
+        read -rp "Enable BBR now? [y/N]: " confirm
+        [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+    fi
 
     if ! modprobe tcp_bbr 2>/dev/null; then
         warn "Could not load tcp_bbr with modprobe. The kernel may not support BBR, or it may already be built in."
@@ -774,19 +810,7 @@ install_sing_box_binary() {
 }
 
 anytls_random_port() {
-    local port
-
-    while true; do
-        if has_command shuf; then
-            port="$(shuf -i 2000-65000 -n 1)"
-        else
-            port="$(awk 'BEGIN{srand(); print int(2000 + rand() * 63000)}')"
-        fi
-        if ! is_port_used "${port}"; then
-            echo "${port}"
-            return 0
-        fi
-    done
+    random_available_port
 }
 
 valid_port() {
@@ -806,6 +830,22 @@ is_port_used() {
     else
         return 1
     fi
+}
+
+random_available_port() {
+    local port
+
+    while true; do
+        if has_command shuf; then
+            port="$(shuf -i 2000-65000 -n 1)"
+        else
+            port="$(awk 'BEGIN{srand(); print int(2000 + rand() * 63000)}')"
+        fi
+        if ! is_port_used "${port}"; then
+            echo "${port}"
+            return 0
+        fi
+    done
 }
 
 anytls_prompt_port() {
@@ -1060,6 +1100,7 @@ certbot_issue_standalone() {
     local email="$2"
     local staging="${3:-false}"
     local staging_arg=""
+    local account_args=()
 
     install_acme_packages
 
@@ -1071,9 +1112,15 @@ certbot_issue_standalone() {
         staging_arg="--test-cert"
     fi
 
+    if [ -n "${email}" ]; then
+        account_args=(--email "${email}")
+    else
+        account_args=(--register-unsafely-without-email)
+    fi
+
     certbot certonly --standalone --non-interactive --agree-tos \
         --preferred-challenges http \
-        --email "${email}" \
+        "${account_args[@]}" \
         -d "${domain}" \
         ${staging_arg}
 }
@@ -1288,8 +1335,7 @@ anytls_install_with_acme_cert() {
     warn "This mode uses certbot standalone HTTP-01. Your domain must point to this VPS and port 80 must be reachable."
     read -rp "Domain for AnyTLS certificate: " domain
     [ -n "${domain}" ] || die "Domain is required."
-    read -rp "Email for Let's Encrypt notices: " email
-    [ -n "${email}" ] || die "Email is required."
+    read -rp "Email for Let's Encrypt notices [Enter = no email]: " email
     read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
     if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
         staging="true"
@@ -1540,8 +1586,8 @@ deploy_bbr_snell_anytls() {
     info "Step 2/3: Snell installation"
     install_snell
     echo
-    info "Step 3/3: AnyTLS installation"
-    anytls_install
+    info "Step 3/3: Certificate + Secure AnyTLS installation"
+    anytls_install_with_acme_cert
 }
 
 restart_proxy_services() {
@@ -1576,7 +1622,7 @@ add_user() {
     require_root
     ensure_dirs
 
-    port="$(prompt_port 8443)"
+    port="$(prompt_port random)"
     file="${USERS_DIR}/snell-${port}.conf"
     [ ! -f "${file}" ] || die "Config already exists for port ${port}: ${file}"
 
@@ -1649,12 +1695,13 @@ show_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}        Snell + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}        githubh01/snell.sh${RESET}"
+    echo -e "${CYAN}        Shortcuts: snell-menu / sat${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo "1. Snell management"
     echo "2. AnyTLS management"
-    echo "3. Enable BBR"
-    echo "4. Deploy Snell + AnyTLS"
-    echo "5. Enable BBR + Deploy Snell + AnyTLS"
+    echo "3. Enable BBR only"
+    echo "4. Deploy Snell + AnyTLS (do not change BBR)"
+    echo "5. Enable BBR, then deploy Snell + certificate AnyTLS"
     echo "6. Restart Snell + AnyTLS services"
     echo "7. Certificate + Secure AnyTLS"
     echo "8. Show Snell config"
@@ -1668,6 +1715,8 @@ show_menu() {
 
 main() {
     local choice
+
+    install_menu_shortcut
 
     while true; do
         show_menu
