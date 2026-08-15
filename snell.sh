@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.2.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,6 +44,15 @@ ANYTLS_DOMAIN_FILE="${ANYTLS_DIR}/domain"
 CF_CERTBOT_CREDENTIALS="/etc/letsencrypt/cloudflare.ini"
 SING_BOX_DOWNLOADED_VERSION=""
 
+VLESS_DIR="/etc/vless-reality"
+VLESS_SING_BOX_BIN="${VLESS_DIR}/sing-box"
+VLESS_CONFIG="${VLESS_DIR}/config.json"
+VLESS_PARAMS_FILE="${VLESS_DIR}/params.conf"
+VLESS_CLIENT_FILE="${VLESS_DIR}/vless-reality.txt"
+VLESS_SERVICE_NAME="vless-reality.service"
+VLESS_SERVICE_FILE="/etc/systemd/system/${VLESS_SERVICE_NAME}"
+VLESS_ALIAS="VLESS-Reality"
+
 info() { echo -e "${CYAN}$*${RESET}"; }
 ok() { echo -e "${GREEN}$*${RESET}"; }
 warn() { echo -e "${YELLOW}$*${RESET}"; }
@@ -75,7 +84,7 @@ $(pwd 2>/dev/null)/hardy.sh
     script_path=""
     while IFS= read -r candidate; do
         [ -n "${candidate}" ] || continue
-        if [ -f "${candidate}" ] && grep -q 'Snell + AnyTLS Manager' "${candidate}" 2>/dev/null; then
+        if [ -f "${candidate}" ] && grep -Eq 'Snell \+ (VLESS-Reality \+ )?AnyTLS Manager' "${candidate}" 2>/dev/null; then
             script_path="${candidate}"
             break
         fi
@@ -147,7 +156,7 @@ cleanup_old_script_files() {
             continue
         fi
 
-        if [ -f "${candidate}" ] && ! grep -Eq 'Snell \+ AnyTLS Manager|Snell management script|githubh01/snell|snell-menu|sat' "${candidate}" 2>/dev/null; then
+        if [ -f "${candidate}" ] && ! grep -Eq 'Snell \+ (VLESS-Reality \+ )?AnyTLS Manager|Snell management script|githubh01/snell|snell-menu|sat' "${candidate}" 2>/dev/null; then
             warn "Skipped unrelated file: ${candidate}"
             continue
         fi
@@ -927,6 +936,7 @@ sing_box_latest_version() {
 }
 
 install_sing_box_binary() {
+    local dest="$1"
     local version
     local version_num
     local arch
@@ -934,8 +944,10 @@ install_sing_box_binary() {
     local name
     local tmpdir
 
+    [ -n "${dest}" ] || die "install_sing_box_binary: destination path is required."
+
     install_anytls_packages
-    mkdir -p "${ANYTLS_DIR}"
+    mkdir -p "$(dirname "${dest}")"
 
     version="$(sing_box_latest_version)"
     version_num="${version#v}"
@@ -955,7 +967,7 @@ install_sing_box_binary() {
         die "sing-box binary was not found in the downloaded archive."
     }
 
-    install -m 0755 "${tmpdir}/${name}/sing-box" "${ANYTLS_SING_BOX_BIN}"
+    install -m 0755 "${tmpdir}/${name}/sing-box" "${dest}"
     rm -rf "${tmpdir}"
     SING_BOX_DOWNLOADED_VERSION="${version}"
 }
@@ -1490,7 +1502,7 @@ anytls_update() {
         [ -n "${domain}" ] || die "AnyTLS TLS domain is missing."
         [ -f "${cert_path}" ] || die "Certificate file is missing: ${cert_path}"
         [ -f "${key_path}" ] || die "Key file is missing: ${key_path}"
-        install_sing_box_binary
+        install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
         version="${SING_BOX_DOWNLOADED_VERSION}"
         anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
         anytls_write_sing_box_service "${version}"
@@ -1539,7 +1551,7 @@ anytls_install_with_acme_cert() {
     key_path="${cert_pair#*|}"
     install_cert_renew_hook
 
-    install_sing_box_binary
+    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
     version="${SING_BOX_DOWNLOADED_VERSION}"
     port="$(anytls_prompt_port)"
     password="$(anytls_password)"
@@ -1601,7 +1613,7 @@ anytls_install_with_cloudflare_cert() {
     key_path="${cert_pair#*|}"
     install_cert_renew_hook
 
-    install_sing_box_binary
+    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
     version="${SING_BOX_DOWNLOADED_VERSION}"
     port="$(anytls_prompt_port)"
     password="$(anytls_password)"
@@ -1638,7 +1650,7 @@ anytls_apply_existing_cert() {
     key_path="${cert_pair#*|}"
     install_cert_renew_hook
 
-    install_sing_box_binary
+    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
     version="${SING_BOX_DOWNLOADED_VERSION}"
     port="$(anytls_config_port)"
     password="$(anytls_config_password)"
@@ -1825,37 +1837,623 @@ anytls_menu() {
     done
 }
 
-deploy_snell_and_anytls() {
+vless_prompt_port() {
+    local input
+
+    while true; do
+        echo "Press Enter for a random available port, or enter a custom port [1-65535] (443 is common for Reality)." >&2
+        read -rp "VLESS+Reality port: " input
+        if [ -z "${input:-}" ]; then
+            input="$(random_available_port)"
+        fi
+        if ! valid_port "${input}"; then
+            err "Invalid port: ${input}"
+            continue
+        fi
+        if is_port_used "${input}"; then
+            err "Port ${input} is already in use."
+            continue
+        fi
+        echo "${input}"
+        return 0
+    done
+}
+
+vless_prompt_sni() {
+    local choice
+    local domain
+
+    while true; do
+        echo >&2
+        info "Choose a Reality handshake target domain (a real TLS 1.3 site not blocked in your region):" >&2
+        echo "1. www.microsoft.com (default)" >&2
+        echo "2. www.bing.com" >&2
+        echo "3. addons.mozilla.org" >&2
+        echo "4. itunes.apple.com" >&2
+        echo "5. Enter a custom domain" >&2
+        read -rp "Select [1-5, Enter = default]: " choice
+        case "${choice}" in
+            ""|1) domain="www.microsoft.com"; break ;;
+            2) domain="www.bing.com"; break ;;
+            3) domain="addons.mozilla.org"; break ;;
+            4) domain="itunes.apple.com"; break ;;
+            5)
+                read -rp "Custom domain: " domain
+                [ -n "${domain}" ] && break
+                err "Domain is required."
+                ;;
+            *) err "Please enter 1-5." ;;
+        esac
+    done
+
+    echo "${domain}"
+}
+
+vless_uuid() {
+    if [ -x "${VLESS_SING_BOX_BIN}" ]; then
+        "${VLESS_SING_BOX_BIN}" generate uuid 2>/dev/null && return 0
+    fi
+    if has_command uuidgen; then
+        uuidgen
+    elif [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        random_psk
+    fi
+}
+
+vless_generate_reality_keypair() {
+    local output
+    local priv
+    local pub
+
+    [ -x "${VLESS_SING_BOX_BIN}" ] || die "sing-box binary not found. Install VLESS+Reality first."
+
+    output="$("${VLESS_SING_BOX_BIN}" generate reality-keypair 2>/dev/null)"
+    [ -n "${output}" ] || die "Failed to generate Reality key pair."
+
+    priv="$(printf '%s\n' "${output}" | sed -nE 's/^PrivateKey:[[:space:]]*(.*)$/\1/p' | head -n1)"
+    pub="$(printf '%s\n' "${output}" | sed -nE 's/^PublicKey:[[:space:]]*(.*)$/\1/p' | head -n1)"
+    [ -n "${priv}" ] && [ -n "${pub}" ] || die "Failed to parse Reality key pair output."
+
+    echo "${priv}|${pub}"
+}
+
+vless_short_id() {
+    if [ -x "${VLESS_SING_BOX_BIN}" ]; then
+        "${VLESS_SING_BOX_BIN}" generate rand 8 --hex 2>/dev/null && return 0
+    fi
+    if has_command openssl; then
+        openssl rand -hex 8
+    else
+        tr -dc 'a-f0-9' </dev/urandom | head -c 16
+    fi
+}
+
+vless_param() {
+    local key="$1"
+
+    [ -f "${VLESS_PARAMS_FILE}" ] || return 0
+    grep -E "^${key}=" "${VLESS_PARAMS_FILE}" | tail -n1 | cut -d= -f2-
+}
+
+write_vless_params() {
+    local port="$1"
+    local uuid="$2"
+    local sni="$3"
+    local priv="$4"
+    local pub="$5"
+    local sid="$6"
+
+    mkdir -p "${VLESS_DIR}"
+    cat > "${VLESS_PARAMS_FILE}" <<EOF
+PORT=${port}
+UUID=${uuid}
+SNI=${sni}
+PRIVATE_KEY=${priv}
+PUBLIC_KEY=${pub}
+SHORT_ID=${sid}
+EOF
+    chmod 600 "${VLESS_PARAMS_FILE}"
+}
+
+write_vless_config() {
+    local port="$1"
+    local uuid="$2"
+    local sni="$3"
+    local priv="$4"
+    local sid="$5"
+
+    mkdir -p "${VLESS_DIR}"
+    cat > "${VLESS_CONFIG}" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": ${port},
+      "users": [
+        {
+          "uuid": "${uuid}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${sni}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${sni}",
+            "server_port": 443
+          },
+          "private_key": "${priv}",
+          "short_id": ["${sid}"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    chmod 600 "${VLESS_CONFIG}"
+}
+
+vless_installed_version() {
+    if [ -f "${VLESS_SERVICE_FILE}" ]; then
+        grep '^X-VLESS-Version=' "${VLESS_SERVICE_FILE}" | sed -E 's/^X-VLESS-Version=//' || true
+    fi
+}
+
+write_vless_service() {
+    local version="$1"
+
+    if [ -z "${version}" ]; then
+        version="$(vless_installed_version)"
+        version="${version:-unknown}"
+    fi
+
+    cat > "${VLESS_SERVICE_FILE}" <<EOF
+[Unit]
+Description=VLESS Reality Server Service via sing-box
+Documentation=https://sing-box.sagernet.org/configuration/inbound/vless/
+After=network-online.target
+Wants=network-online.target
+X-VLESS-Version=${version}
+
+[Service]
+Type=simple
+User=root
+ExecStart=${VLESS_SING_BOX_BIN} run -c ${VLESS_CONFIG}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+vless_is_installed() {
+    [ -x "${VLESS_SING_BOX_BIN}" ] || [ -f "${VLESS_SERVICE_FILE}" ]
+}
+
+vless_is_active() {
+    systemctl is-active "${VLESS_SERVICE_NAME}" >/dev/null 2>&1
+}
+
+vless_restart() {
+    systemctl daemon-reload
+    systemctl enable "${VLESS_SERVICE_NAME}" >/dev/null
+    systemctl restart "${VLESS_SERVICE_NAME}"
+    systemctl --no-pager --full status "${VLESS_SERVICE_NAME}" | sed -n '1,8p' || true
+}
+
+vless_client_export() {
+    local port
+    local uuid
+    local sni
+    local pub
+    local sid
+    local ip
+    local alias_enc
+    local link
+    local link_enc
+
+    [ -f "${VLESS_PARAMS_FILE}" ] || die "VLESS+Reality config not found: ${VLESS_PARAMS_FILE}"
+
+    port="$(vless_param PORT)"
+    uuid="$(vless_param UUID)"
+    sni="$(vless_param SNI)"
+    pub="$(vless_param PUBLIC_KEY)"
+    sid="$(vless_param SHORT_ID)"
+    ip="$(anytls_public_ip)"
+    ip="${ip:-YOUR_SERVER_IP}"
+    alias_enc="$(urlencode "${VLESS_ALIAS}")"
+    link="vless://${uuid}@${ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${alias_enc}"
+    link_enc="$(urlencode "${link}")"
+
+    mkdir -p "${VLESS_DIR}"
+    cat > "${VLESS_CLIENT_FILE}" <<EOF
+VLESS + Reality client parameters
+Address: ${ip}
+Port: ${port}
+UUID: ${uuid}
+Flow: xtls-rprx-vision
+Encryption: none
+Security: reality
+SNI (server_name): ${sni}
+Fingerprint: chrome
+Public key: ${pub}
+Short ID: ${sid}
+Network: tcp
+URL: ${link}
+QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link_enc}
+EOF
+
+    echo
+    ok "VLESS + Reality client parameters"
+    cat "${VLESS_CLIENT_FILE}"
+}
+
+vless_install() {
+    local port
+    local uuid
+    local sni
+    local keys
+    local priv
+    local pub
+    local sid
+    local version
+
     require_root
-    info "Step 1/2: Snell installation"
+
+    install_sing_box_binary "${VLESS_SING_BOX_BIN}"
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+
+    port="$(vless_prompt_port)"
+    sni="$(vless_prompt_sni)"
+    uuid="$(vless_uuid)"
+    keys="$(vless_generate_reality_keypair)"
+    priv="${keys%%|*}"
+    pub="${keys#*|}"
+    sid="$(vless_short_id)"
+
+    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    write_vless_service "${version}"
+    vless_restart
+
+    if vless_is_active; then
+        ok "VLESS+Reality is installed and running."
+        vless_client_export
+    else
+        warn "VLESS+Reality did not become active. Check: journalctl -u ${VLESS_SERVICE_NAME} -e"
+    fi
+}
+
+vless_update() {
+    local port
+    local uuid
+    local sni
+    local priv
+    local pub
+    local sid
+    local version
+
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+
+    port="$(vless_param PORT)"
+    uuid="$(vless_param UUID)"
+    sni="$(vless_param SNI)"
+    priv="$(vless_param PRIVATE_KEY)"
+    pub="$(vless_param PUBLIC_KEY)"
+    sid="$(vless_param SHORT_ID)"
+    [ -n "${port}" ] && [ -n "${uuid}" ] && [ -n "${sni}" ] && [ -n "${priv}" ] && [ -n "${sid}" ] || \
+        die "Existing VLESS+Reality parameters are incomplete. Reinstall instead."
+
+    install_sing_box_binary "${VLESS_SING_BOX_BIN}"
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    write_vless_service "${version}"
+    vless_restart
+    ok "VLESS+Reality binary update completed."
+    vless_client_export
+}
+
+vless_uninstall() {
+    local confirm
+
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+
+    read -rp "Uninstall VLESS+Reality and delete ${VLESS_DIR}? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+
+    systemctl disable --now "${VLESS_SERVICE_NAME}" 2>/dev/null || true
+    rm -f "${VLESS_SERVICE_FILE}"
+    rm -rf "${VLESS_DIR}"
+    systemctl daemon-reload 2>/dev/null || true
+    ok "VLESS+Reality uninstalled."
+}
+
+vless_change_port() {
+    local port
+    local uuid
+    local sni
+    local priv
+    local pub
+    local sid
+
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+
+    port="$(vless_prompt_port)"
+    uuid="$(vless_param UUID)"
+    sni="$(vless_param SNI)"
+    priv="$(vless_param PRIVATE_KEY)"
+    pub="$(vless_param PUBLIC_KEY)"
+    sid="$(vless_param SHORT_ID)"
+
+    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    write_vless_service ""
+    vless_restart
+    vless_client_export
+}
+
+vless_change_uuid() {
+    local port
+    local uuid
+    local sni
+    local priv
+    local pub
+    local sid
+
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+
+    port="$(vless_param PORT)"
+    uuid="$(vless_uuid)"
+    sni="$(vless_param SNI)"
+    priv="$(vless_param PRIVATE_KEY)"
+    pub="$(vless_param PUBLIC_KEY)"
+    sid="$(vless_param SHORT_ID)"
+
+    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    write_vless_service ""
+    vless_restart
+    vless_client_export
+}
+
+vless_change_sni() {
+    local port
+    local uuid
+    local sni
+    local priv
+    local pub
+    local sid
+
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+
+    port="$(vless_param PORT)"
+    uuid="$(vless_param UUID)"
+    sni="$(vless_prompt_sni)"
+    priv="$(vless_param PRIVATE_KEY)"
+    pub="$(vless_param PUBLIC_KEY)"
+    sid="$(vless_param SHORT_ID)"
+
+    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    write_vless_service ""
+    vless_restart
+    vless_client_export
+}
+
+vless_regenerate_keys() {
+    local port
+    local uuid
+    local sni
+    local keys
+    local priv
+    local pub
+    local sid
+
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+
+    port="$(vless_param PORT)"
+    uuid="$(vless_param UUID)"
+    sni="$(vless_param SNI)"
+    keys="$(vless_generate_reality_keypair)"
+    priv="${keys%%|*}"
+    pub="${keys#*|}"
+    sid="$(vless_short_id)"
+
+    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    write_vless_service ""
+    vless_restart
+    vless_client_export
+}
+
+vless_status() {
+    if vless_is_installed; then
+        echo
+        ok "VLESS+Reality installed"
+        echo "Version: $(vless_installed_version)"
+        echo "Port: $(vless_param PORT)"
+        echo "SNI: $(vless_param SNI)"
+        if vless_is_active; then
+            echo "Status: running"
+        else
+            echo "Status: stopped"
+        fi
+        systemctl --no-pager --full status "${VLESS_SERVICE_NAME}" | sed -n '1,8p' || true
+    else
+        warn "VLESS+Reality is not installed."
+    fi
+}
+
+vless_start() {
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+    systemctl start "${VLESS_SERVICE_NAME}"
+    vless_status
+}
+
+vless_stop() {
+    require_root
+    vless_is_installed || die "VLESS+Reality is not installed."
+    systemctl stop "${VLESS_SERVICE_NAME}"
+    vless_status
+}
+
+vless_logs() {
+    journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 80 || true
+}
+
+vless_menu() {
+    local choice
+
+    while true; do
+        clear
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}        VLESS + Reality Manager${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo "1. Install / reinstall VLESS+Reality"
+        echo "2. Update sing-box binary"
+        echo "3. Show client config"
+        echo "4. Change port"
+        echo "5. Change UUID"
+        echo "6. Change Reality handshake domain (SNI)"
+        echo "7. Regenerate Reality key pair + short ID"
+        echo "8. Show service status"
+        echo "9. Start service"
+        echo "10. Stop service"
+        echo "11. Show logs"
+        echo "12. Uninstall VLESS+Reality"
+        echo "0. Back"
+        echo -e "${CYAN}============================================${RESET}"
+        read -rp "Select [0-12]: " choice
+        case "${choice}" in
+            1) vless_install ;;
+            2) vless_update ;;
+            3) vless_client_export ;;
+            4) vless_change_port ;;
+            5) vless_change_uuid ;;
+            6) vless_change_sni ;;
+            7) vless_regenerate_keys ;;
+            8) vless_status ;;
+            9) vless_start ;;
+            10) vless_stop ;;
+            11) vless_logs ;;
+            12) vless_uninstall ;;
+            0) return 0 ;;
+            *) err "Invalid option." ;;
+        esac
+        echo
+        read -rp "Press Enter to return to the VLESS+Reality menu..." _
+    done
+}
+
+deploy_three_no_cert() {
+    require_root
+    info "Step 1/3: Snell installation"
     install_snell
     echo
-    info "Step 2/2: AnyTLS installation"
+    info "Step 2/3: VLESS+Reality installation"
+    vless_install
+    echo
+    info "Step 3/3: AnyTLS installation (self-signed, no domain certificate)"
     anytls_install
 }
 
-deploy_bbr_snell_anytls() {
+deploy_three_with_domain_cert() {
+    local method
+
     require_root
-    info "Step 1/3: Enable BBR"
-    enable_bbr
-    echo
-    info "Step 2/3: Snell installation"
+    info "Step 1/3: Snell installation"
     install_snell
     echo
-    info "Step 3/3: Certificate + Secure AnyTLS installation"
-    anytls_install_with_acme_cert
+    info "Step 2/3: VLESS+Reality installation"
+    warn "VLESS+Reality does not use your domain certificate by design: Reality borrows a real site's TLS handshake instead of presenting your own certificate."
+    vless_install
+    echo
+    info "Step 3/3: AnyTLS installation using your domain certificate"
+    echo "1. Issue a new certificate via HTTP-01 (port 80 must be reachable)"
+    echo "2. Issue a new certificate via Cloudflare DNS-01 (port 80 not required)"
+    echo "3. Use an existing Let's Encrypt certificate already issued for a domain"
+    read -rp "Select certificate method [1-3]: " method
+    case "${method}" in
+        1) anytls_install_with_acme_cert ;;
+        2) anytls_install_with_cloudflare_cert ;;
+        3) anytls_apply_existing_cert ;;
+        *) err "Invalid option."; return 1 ;;
+    esac
+}
+
+deploy_bbr_three_with_domain_cert() {
+    local method
+
+    require_root
+    info "Step 1/4: Enable BBR"
+    enable_bbr
+    echo
+    info "Step 2/4: Snell installation"
+    install_snell
+    echo
+    info "Step 3/4: VLESS+Reality installation"
+    warn "VLESS+Reality does not use your domain certificate by design: Reality borrows a real site's TLS handshake instead of presenting your own certificate."
+    vless_install
+    echo
+    info "Step 4/4: AnyTLS installation using your domain certificate"
+    echo "1. Issue a new certificate via HTTP-01 (port 80 must be reachable)"
+    echo "2. Issue a new certificate via Cloudflare DNS-01 (port 80 not required)"
+    echo "3. Use an existing Let's Encrypt certificate already issued for a domain"
+    read -rp "Select certificate method [1-3]: " method
+    case "${method}" in
+        1) anytls_install_with_acme_cert ;;
+        2) anytls_install_with_cloudflare_cert ;;
+        3) anytls_apply_existing_cert ;;
+        *) err "Invalid option."; return 1 ;;
+    esac
 }
 
 restart_proxy_services() {
     require_root
 
-    info "Restarting Snell and AnyTLS services only. BBR will not be restarted or changed."
+    info "Restarting Snell, VLESS+Reality, and AnyTLS services only. BBR will not be restarted or changed."
 
     if [ -f "${SERVICE_FILE}" ]; then
         systemctl restart snell
         ok "Snell service restarted."
     else
         warn "Snell service file not found; skipped."
+    fi
+
+    if [ -f "${VLESS_SERVICE_FILE}" ]; then
+        systemctl restart "${VLESS_SERVICE_NAME}"
+        ok "VLESS+Reality service restarted."
+    else
+        warn "VLESS+Reality service file not found; skipped."
     fi
 
     if [ -f "${ANYTLS_SERVICE_FILE}" ]; then
@@ -1938,38 +2536,44 @@ Security notes:
 - This script does not upload server information, config, ports, or PSKs.
 - Snell binaries are downloaded only from https://dl.nssurge.com/snell/.
 - AnyTLS binaries are downloaded only from https://github.com/anytls/anytls-go/releases.
-- Secure AnyTLS with real certificates uses system certbot and official sing-box releases.
+- VLESS+Reality and secure AnyTLS both run on official sing-box releases from https://github.com/SagerNet/sing-box/releases.
+- Reality mode does not use your own certificate: it borrows a real site's TLS handshake, so no domain or port 80 is required for VLESS+Reality.
 - Cloudflare DNS certificates store the API token at /etc/letsencrypt/cloudflare.ini with chmod 600.
 - BBR is enabled locally through sysctl and modprobe only; no remote BBR script is used.
 - Old script cleanup removes only legacy menu script files and shortcuts after confirmation.
 - Features from third-party scripts were reimplemented locally instead of being pasted as remote-execution code.
 - Do not publish /etc/snell/users/*.conf because those files contain PSKs.
 - Do not publish /etc/AnyTLS/config.yaml because it contains the AnyTLS password.
+- Do not publish /etc/vless-reality/params.conf or config.json because they contain your UUID and Reality private key.
 EOF
 }
 
 show_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}        Snell + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
+    echo -e "${CYAN}        Snell + VLESS-Reality + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}        githubh01/snell.sh${RESET}"
     echo -e "${CYAN}        Shortcut: hardy${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo "1. Snell management"
-    echo "2. AnyTLS management"
-    echo "3. Enable BBR only"
-    echo "4. Deploy Snell + AnyTLS (do not change BBR)"
-    echo "5. Enable BBR, then deploy Snell + HTTP-01 certificate AnyTLS"
-    echo "6. Restart Snell + AnyTLS services"
-    echo "7. HTTP-01 certificate + Secure AnyTLS (requires port 80)"
-    echo "8. Cloudflare DNS certificate + Secure AnyTLS (no port 80)"
-    echo "9. Show Snell config"
-    echo "10. Show AnyTLS config"
-    echo "11. Show Snell status"
-    echo "12. Show AnyTLS status"
-    echo "13. Install / repair hardy shortcut"
-    echo "14. Clean old script files"
-    echo "15. Security notes"
+    echo "2. VLESS+Reality management"
+    echo "3. AnyTLS management"
+    echo "4. Enable BBR only"
+    echo "5. Deploy Snell + VLESS-Reality + AnyTLS (no domain certificate, BBR unchanged)"
+    echo "6. Deploy Snell + VLESS-Reality + AnyTLS using your domain certificate (BBR unchanged)"
+    echo "7. Enable BBR, then deploy Snell + VLESS-Reality + AnyTLS using your domain certificate"
+    echo "8. Restart Snell + VLESS-Reality + AnyTLS services"
+    echo "9. HTTP-01 certificate + Secure AnyTLS only (requires port 80)"
+    echo "10. Cloudflare DNS certificate + Secure AnyTLS only (no port 80)"
+    echo "11. Show Snell config"
+    echo "12. Show VLESS+Reality config"
+    echo "13. Show AnyTLS config"
+    echo "14. Show Snell status"
+    echo "15. Show VLESS+Reality status"
+    echo "16. Show AnyTLS status"
+    echo "17. Install / repair hardy shortcut"
+    echo "18. Clean old script files"
+    echo "19. Security notes"
     echo "0. Exit"
     echo -e "${CYAN}============================================${RESET}"
 }
@@ -1981,23 +2585,27 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-15]: " choice
+        read -rp "Select [0-19]: " choice
         case "${choice}" in
             1) snell_menu ;;
-            2) anytls_menu ;;
-            3) enable_bbr ;;
-            4) deploy_snell_and_anytls ;;
-            5) deploy_bbr_snell_anytls ;;
-            6) restart_proxy_services ;;
-            7) anytls_install_with_acme_cert ;;
-            8) anytls_install_with_cloudflare_cert ;;
-            9) show_config ;;
-            10) anytls_client_export ;;
-            11) service_status ;;
-            12) anytls_status ;;
-            13) repair_hardy_shortcut ;;
-            14) cleanup_old_script_files ;;
-            15) security_note ;;
+            2) vless_menu ;;
+            3) anytls_menu ;;
+            4) enable_bbr ;;
+            5) deploy_three_no_cert ;;
+            6) deploy_three_with_domain_cert ;;
+            7) deploy_bbr_three_with_domain_cert ;;
+            8) restart_proxy_services ;;
+            9) anytls_install_with_acme_cert ;;
+            10) anytls_install_with_cloudflare_cert ;;
+            11) show_config ;;
+            12) vless_client_export ;;
+            13) anytls_client_export ;;
+            14) service_status ;;
+            15) vless_status ;;
+            16) anytls_status ;;
+            17) repair_hardy_shortcut ;;
+            18) cleanup_old_script_files ;;
+            19) security_note ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option." ;;
         esac
