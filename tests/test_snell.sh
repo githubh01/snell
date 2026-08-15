@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Static/functional test harness for the ./snell script.
+# shellcheck disable=SC2034  # path vars below are consumed by the sourced script
 # Sources the script with main() disabled and paths redirected to a sandbox.
 
 set -uo pipefail
 
-SP="$(dirname "$0")"
 SANDBOX="$(mktemp -d)"
 PASS=0
 FAIL=0
@@ -19,6 +19,9 @@ TARGET="$(cd "$(dirname "$0")/.." && pwd)/snell"
 sed 's/^main "\$@"$/: # disabled/' "$TARGET" > "$SANDBOX/lib.sh"
 # shellcheck disable=SC1090
 source "$SANDBOX/lib.sh"
+# The script enables errexit; the harness must survive functions that
+# deliberately return non-zero, so turn it back off after sourcing.
+set +e
 
 # Redirect all state into the sandbox.
 VLESS_DIR="$SANDBOX/vless"
@@ -295,6 +298,34 @@ echo "== 18. Status helpers write diagnostics to stderr, not stdout =="
 # info/ok/warn are diagnostics; nothing that returns data may emit them on stdout.
 out="$(info "x"; ok "y"; warn "z"; err "w"; true)"
 check "info/ok/warn/err produce no stdout" "$out" ""
+
+echo "== 19. port_is_listening must never fail open =="
+# Regression: an earlier version returned success when no socket tool was
+# installed, making every listener verification meaningless.
+python3 -c "
+import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('0.0.0.0',48231)); s.listen(1); time.sleep(8)
+" &
+PROBE_PID=$!
+sleep 1
+port_is_listening 48231 1; rc=$?
+check "occupied port reports listening" "$rc" "0"
+port_is_listening 48232 1; rc=$?
+if [ "$rc" = "1" ] || [ "$rc" = "2" ]; then
+  t_ok "free port does not report listening (rc=$rc)"
+else
+  t_bad "free port does not report listening" "rc=$rc (0 would be a false positive)"
+fi
+# With no socket tool at all, a free port must be "unknown" (2), never "listening" (0).
+_real_has_command="$(declare -f has_command)"
+has_command() { case "$1" in ss|netstat|lsof) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+port_is_listening 48231 1; rc=$?
+check "probe fallback detects a real listener" "$rc" "0"
+port_is_listening 48232 1; rc=$?
+check "probe fallback reports unknown, not listening" "$rc" "2"
+eval "$_real_has_command"
+kill "$PROBE_PID" 2>/dev/null; wait "$PROBE_PID" 2>/dev/null || true
 
 echo
 echo "=================================="

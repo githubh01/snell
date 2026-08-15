@@ -188,23 +188,62 @@ service_is_active() {
     systemctl is-active --quiet "$1" 2>/dev/null
 }
 
+# True when a TCP connect to the port on loopback succeeds. Used as a last
+# resort when no socket-listing tool is installed.
+tcp_probe_port() {
+    local port="$1"
+
+    (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && exec 3>&- && return 0
+    (exec 3<>"/dev/tcp/::1/${port}") 2>/dev/null && exec 3>&- && return 0
+    return 1
+}
+
 # Confirms something is actually bound to the port, so we never claim success
 # for a service that started and then died on its own listener.
+#
+# Returns 0 = listening, 1 = not listening, 2 = could not determine.
+# It must never report "listening" without having actually checked: an
+# earlier version returned success when no tool was installed, which made
+# the whole verification step meaningless on minimal systems.
 port_is_listening() {
     local port="$1"
     local tries="${2:-10}"
     local i
+    local method="none"
+
+    if has_command ss; then
+        method="ss"
+    elif has_command netstat; then
+        method="netstat"
+    elif has_command lsof; then
+        method="lsof"
+    else
+        method="probe"
+    fi
 
     for (( i=0; i<tries; i++ )); do
-        if has_command ss; then
-            ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$" && return 0
-        elif has_command netstat; then
-            netstat -tuln 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$" && return 0
-        else
-            return 0
-        fi
-        sleep 1
+        case "${method}" in
+            ss)
+                ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$" && return 0
+                ;;
+            netstat)
+                netstat -tuln 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$" && return 0
+                ;;
+            lsof)
+                lsof -iTCP:"${port}" -sTCP:LISTEN -n -P >/dev/null 2>&1 && return 0
+                ;;
+            probe)
+                tcp_probe_port "${port}" && return 0
+                ;;
+        esac
+        [ "$((i + 1))" -lt "${tries}" ] && sleep 1
     done
+
+    # A failed loopback probe is ambiguous: bash may lack /dev/tcp support, or
+    # the service may be bound to a public address only. Report "unknown"
+    # rather than failing an otherwise healthy install on weak evidence.
+    [ "${method}" = "probe" ] && return 2
+
     return 1
 }
 
@@ -238,14 +277,21 @@ activate_and_verify() {
         return 1
     fi
 
-    if [ -n "${port}" ] && ! port_is_listening "${port}"; then
-        journalctl -u "${unit}" --no-pager -n 30 >&2 || true
-        fail_step "${label} listener check" \
-            "${unit} is active but nothing is listening on port ${port}." \
-            "- The service may have bound a different port than configured.
+    if [ -n "${port}" ]; then
+        port_is_listening "${port}"
+        case "$?" in
+            0) ok "${label} is listening on port ${port}." ;;
+            2) warn "${label}: could not verify the listener (no ss/netstat/lsof available)." ;;
+            *)
+                journalctl -u "${unit}" --no-pager -n 30 >&2 || true
+                fail_step "${label} listener check" \
+                    "${unit} is active but nothing is listening on port ${port}." \
+                    "- The service may have bound a different port than configured.
 - A firewall or another process may be interfering." \
-            "journalctl -u ${unit} -e --no-pager"
-        return 1
+                    "journalctl -u ${unit} -e --no-pager"
+                return 1
+                ;;
+        esac
     fi
 
     return 0
@@ -538,20 +584,22 @@ ensure_core_packages() {
 
     install_packages
 
-    for cmd in openssl jq; do
+    # ss comes from iproute2 and is what proves a service really bound its
+    # port; without it the listener verification can only be skipped.
+    for cmd in openssl jq ss; do
         has_command "${cmd}" || missing+=("${cmd}")
     done
 
     if [ "${#missing[@]}" -gt 0 ]; then
         warn "Installing additional dependencies: ${missing[*]}"
         if has_command apt-get; then
-            run_apt_get install -y openssl jq ca-certificates
+            run_apt_get install -y openssl jq ca-certificates iproute2
         elif has_command dnf; then
-            dnf install -y openssl jq ca-certificates
+            dnf install -y openssl jq ca-certificates iproute
         elif has_command yum; then
-            yum install -y openssl jq ca-certificates
+            yum install -y openssl jq ca-certificates iproute
         elif has_command apk; then
-            apk add --no-cache openssl jq ca-certificates
+            apk add --no-cache openssl jq ca-certificates iproute2
         else
             fail_step "dependency install" \
                 "No supported package manager found to install: ${missing[*]}" \
@@ -1320,11 +1368,12 @@ service_status() {
 
     port="$(snell_main_port)"
     if [ -n "${port}" ]; then
-        if port_is_listening "${port}" 1; then
-            echo "Listener: port ${port} is listening"
-        else
-            warn "Listener: nothing is listening on port ${port}"
-        fi
+        port_is_listening "${port}" 1
+        case "$?" in
+            0) echo "Listener: port ${port} is listening" ;;
+            2) warn "Listener: cannot verify (install iproute2 for 'ss')" ;;
+            *) warn "Listener: nothing is listening on port ${port}" ;;
+        esac
     fi
 
     systemctl --no-pager --full status snell 2>/dev/null | sed -n '1,8p' || true
@@ -2718,11 +2767,12 @@ anytls_status() {
 
     port="$(anytls_cfg_port 2>/dev/null || true)"
     if [ -n "${port}" ]; then
-        if port_is_listening "${port}" 1; then
-            echo "Listener: port ${port} is listening"
-        else
-            warn "Listener: nothing is listening on port ${port}"
-        fi
+        port_is_listening "${port}" 1
+        case "$?" in
+            0) echo "Listener: port ${port} is listening" ;;
+            2) warn "Listener: cannot verify (install iproute2 for 'ss')" ;;
+            *) warn "Listener: nothing is listening on port ${port}" ;;
+        esac
     fi
 
     systemctl --no-pager --full status "${ANYTLS_SERVICE_NAME}" 2>/dev/null | sed -n '1,8p' || true
@@ -3427,11 +3477,12 @@ vless_status() {
 
     port="$(vless_cfg_port 2>/dev/null || true)"
     if [ -n "${port}" ]; then
-        if port_is_listening "${port}" 1; then
-            echo "Listener: port ${port} is listening"
-        else
-            warn "Listener: nothing is listening on port ${port}"
-        fi
+        port_is_listening "${port}" 1
+        case "$?" in
+            0) echo "Listener: port ${port} is listening" ;;
+            2) warn "Listener: cannot verify (install iproute2 for 'ss')" ;;
+            *) warn "Listener: nothing is listening on port ${port}" ;;
+        esac
     fi
 
     systemctl --no-pager --full status "${VLESS_SERVICE_NAME}" 2>/dev/null | sed -n '1,8p' || true
@@ -3455,6 +3506,192 @@ vless_logs() {
     journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 80 || true
 }
 
+# Reports whether a local firewall appears to block a port. Best effort: it
+# only reports what it can see and never changes any rule.
+report_firewall_for_port() {
+    local port="$1"
+    local seen=0
+
+    if has_command ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        seen=1
+        if ufw status 2>/dev/null | grep -qE "(^|[[:space:]])${port}(/|[[:space:]]|$)"; then
+            ok "ufw is active and has a rule mentioning port ${port}."
+        else
+            warn "ufw is ACTIVE and no rule mentions port ${port}."
+            warn "  Allow it with: ufw allow ${port}/tcp"
+        fi
+    fi
+
+    if has_command firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        seen=1
+        if firewall-cmd --list-ports 2>/dev/null | grep -qE "(^|[[:space:]])${port}/tcp"; then
+            ok "firewalld is running and port ${port}/tcp is open."
+        else
+            warn "firewalld is RUNNING and port ${port}/tcp is not in the open list."
+            warn "  Allow it with: firewall-cmd --add-port=${port}/tcp --permanent && firewall-cmd --reload"
+        fi
+    fi
+
+    if [ "${seen}" -eq 0 ]; then
+        if has_command iptables && iptables -S 2>/dev/null | grep -qE '^-P INPUT DROP'; then
+            warn "iptables INPUT policy is DROP; make sure port ${port}/tcp is explicitly allowed."
+        else
+            info "No active ufw/firewalld detected on this host."
+        fi
+    fi
+
+    warn "A cloud provider security group can still block the port even when the"
+    warn "host firewall allows it. Check your VPS control panel for port ${port}/tcp."
+}
+
+# Distinguishes the failure modes that look identical from a client:
+# port unreachable, Reality handshake target unreachable, clock skew, or a
+# client-side flow/parameter mismatch.
+vless_diagnose() {
+    local port sni uuid sid pub host problems=0
+    local tls_out=""
+
+    require_root
+
+    if [ ! -s "${VLESS_CONFIG}" ]; then
+        fail_step "VLESS+Reality diagnosis" "No config at ${VLESS_CONFIG}" \
+            "- Install VLESS+Reality first."
+        return 1
+    fi
+
+    port="$(vless_cfg_port 2>/dev/null || true)"
+    sni="$(vless_cfg_sni 2>/dev/null || true)"
+    uuid="$(vless_cfg_uuid 2>/dev/null || true)"
+    sid="$(vless_cfg_sid 2>/dev/null || true)"
+    pub="$(vless_cfg_pubkey 2>/dev/null || true)"
+
+    echo
+    info "=== VLESS+Reality diagnosis ==="
+
+    # 1. Service
+    if service_is_active "${VLESS_SERVICE_NAME}"; then
+        ok "1. Service ${VLESS_SERVICE_NAME} is active."
+    else
+        err "1. Service ${VLESS_SERVICE_NAME} is NOT active."
+        problems=$((problems + 1))
+        journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 20 >&2 || true
+    fi
+
+    # 2. Config accepted by this sing-box build
+    if [ -x "${VLESS_SING_BOX_BIN}" ]; then
+        if "${VLESS_SING_BOX_BIN}" check -c "${VLESS_CONFIG}" >/dev/null 2>&1; then
+            ok "2. sing-box accepts the config."
+        else
+            err "2. sing-box REJECTS the config:"
+            "${VLESS_SING_BOX_BIN}" check -c "${VLESS_CONFIG}" 2>&1 | sed 's/^/     /' >&2 || true
+            problems=$((problems + 1))
+        fi
+    else
+        err "2. sing-box binary missing at ${VLESS_SING_BOX_BIN}"
+        problems=$((problems + 1))
+    fi
+
+    # 3. Listener
+    port_is_listening "${port}" 1
+    case "$?" in
+        0)
+            ok "3. Port ${port} is listening locally."
+            if has_command ss; then
+                ss -tlnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print "     " $0}' >&2 || true
+            fi
+            ;;
+        2)
+            warn "3. Cannot verify the listener: no ss/netstat/lsof on this host."
+            warn "   Install iproute2 to enable this check."
+            ;;
+        *)
+            err "3. Nothing is listening on port ${port}."
+            problems=$((problems + 1))
+            ;;
+    esac
+
+    # 4. Firewall / security group
+    echo
+    info "4. Firewall check for port ${port}"
+    report_firewall_for_port "${port}"
+
+    # 5. Reality handshake target reachability -- the check that matters most
+    #    here, and the one AnyTLS never needs.
+    echo
+    info "5. Reality handshake target: ${sni}"
+    if has_command timeout && has_command openssl; then
+        tls_out="$(timeout 10 openssl s_client -connect "${sni}:443" -servername "${sni}" </dev/null 2>&1 || true)"
+        if printf '%s' "${tls_out}" | grep -q "CONNECTED"; then
+            ok "   This server can reach ${sni}:443"
+            if printf '%s' "${tls_out}" | grep -qE "Protocol *: *TLSv1\.3|TLSv1\.3"; then
+                ok "   ${sni} negotiates TLS 1.3 (required by Reality)."
+            else
+                err "   ${sni} did NOT negotiate TLS 1.3. Reality requires a TLS 1.3 target."
+                warn "   Change it from the VLESS menu: 'Change masquerade SNI'."
+                problems=$((problems + 1))
+            fi
+        else
+            err "   This server CANNOT reach ${sni}:443"
+            err "   Reality relays the TLS handshake to this site, so it cannot work."
+            warn "   Pick a target your server can actually reach, from the VLESS menu:"
+            warn "   'Change masquerade SNI (handshake target)'."
+            problems=$((problems + 1))
+        fi
+    else
+        warn "   Skipped: openssl or timeout is unavailable."
+    fi
+
+    # 6. Clock: Reality rejects handshakes outside a tolerance window.
+    echo
+    info "6. System clock"
+    echo "   UTC now: $(date -u)"
+    if has_command timedatectl; then
+        if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
+            ok "   Clock is NTP-synchronised."
+        else
+            warn "   Clock is NOT NTP-synchronised. Reality is time-sensitive."
+            warn "   Fix with: timedatectl set-ntp true"
+        fi
+    fi
+
+    # 7. Effective client parameters
+    echo
+    info "7. Client must match these exactly"
+    host="$(client_endpoint_host)"
+    echo "   address    : ${host}"
+    echo "   port       : ${port}"
+    echo "   uuid       : ${uuid}"
+    echo "   flow       : xtls-rprx-vision"
+    echo "   security   : reality"
+    echo "   sni        : ${sni}"
+    echo "   fingerprint: chrome"
+    echo "   publicKey  : ${pub}"
+    echo "   shortId    : ${sid}"
+    echo "   network    : tcp"
+    warn "   TLS 'allow insecure' must be OFF for Reality."
+    warn "   The client must support Reality + xtls-rprx-vision. If it connects"
+    warn "   but no traffic flows, an unsupported or missing flow is the usual cause."
+
+    # 8. Recent errors
+    echo
+    info "8. Recent service errors"
+    if journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 200 2>/dev/null \
+        | grep -iE "error|fatal|reject|refused|timeout" | tail -n 10 | sed 's/^/   /'; then
+        :
+    fi
+    journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 200 2>/dev/null \
+        | grep -iqE "error|fatal|reject|refused|timeout" || ok "   No obvious errors in the last 200 log lines."
+
+    echo
+    if [ "${problems}" -eq 0 ]; then
+        ok "No server-side fault found. Focus on the client parameters in step 7,"
+        ok "and on any cloud provider security group for port ${port}."
+    else
+        err "Found ${problems} server-side problem(s). Fix the items marked above."
+    fi
+    return 0
+}
+
 vless_menu() {
     local choice
 
@@ -3476,10 +3713,11 @@ vless_menu() {
         echo "10. Start service"
         echo "11. Stop service"
         echo "12. Show logs"
-        echo "13. Uninstall VLESS+Reality"
+        echo "13. Diagnose connectivity (why clients cannot connect)"
+        echo "14. Uninstall VLESS+Reality"
         echo "0. Back"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-13]: " choice
+        read -rp "Select [0-14]: " choice
         case "${choice}" in
             1) vless_install || true ;;
             2) vless_update || true ;;
@@ -3493,7 +3731,8 @@ vless_menu() {
             10) vless_start ;;
             11) vless_stop ;;
             12) vless_logs ;;
-            13) vless_uninstall ;;
+            13) vless_diagnose || true ;;
+            14) vless_uninstall ;;
             0) return 0 ;;
             *) err "Invalid option." ;;
         esac
