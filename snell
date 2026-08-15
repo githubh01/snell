@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Snell management script for githubh01/snell.sh
+# Snell + VLESS-Reality + AnyTLS management script for githubh01/snell
 #
 # This script is self-contained by design:
 # - no remote shell execution
@@ -325,9 +325,13 @@ install_menu_shortcut() {
     script_path="$(readlink -f "$0" 2>/dev/null || true)"
     [ "${script_path}" = "${SHORTCUT_PRIMARY}" ] && return 0
 
+    # Both the extensionless name and the historical .sh name are accepted so
+    # the shortcut still installs on boxes that saved an earlier copy.
     candidates="${script_path}
+$(pwd 2>/dev/null)/snell
 $(pwd 2>/dev/null)/snell.sh
 $(pwd 2>/dev/null)/hardy.sh
+/root/snell
 /root/snell.sh
 /root/hardy.sh"
 
@@ -343,7 +347,7 @@ ${candidates}
 EOF
 
     if [ -z "${script_path}" ]; then
-        warn "Could not install shortcut: script file was not found. Save this script as /root/snell.sh and run it once, then command 'hardy' will work."
+        warn "Could not install shortcut: script file was not found. Save this script as /root/snell and run it once, then command 'hardy' will work."
         return 1
     fi
 
@@ -368,7 +372,7 @@ cleanup_old_script_files() {
     local resolved
     local current_path
     local shortcut_path
-    local root_script_path
+    local keep_paths
     local tmp_list
     local confirm
     local removed=0
@@ -377,8 +381,14 @@ cleanup_old_script_files() {
 
     current_path="$(readlink -f "$0" 2>/dev/null || true)"
     shortcut_path="$(readlink -f "${SHORTCUT_PRIMARY}" 2>/dev/null || true)"
-    root_script_path="$(readlink -f /root/snell.sh 2>/dev/null || true)"
     tmp_list="$(mktemp)"
+
+    # Paths that must survive cleanup: the copy being run, the hardy shortcut,
+    # and a saved script under /root under either supported name.
+    keep_paths="${current_path}
+${shortcut_path}
+$(readlink -f /root/snell 2>/dev/null || true)
+$(readlink -f /root/snell.sh 2>/dev/null || true)"
 
     candidates="/usr/local/bin/sat
 /usr/local/bin/snell-menu
@@ -387,22 +397,19 @@ cleanup_old_script_files() {
 /root/sat
 /root/snell-menu
 /root/snell.old.sh
+/root/snell.old
 /root/snell.sh.old
 /root/snell.sh.bak
-/root/snell.sh.backup"
+/root/snell.sh.backup
+/root/snell.bak
+/root/snell.backup"
 
     while IFS= read -r candidate; do
         [ -n "${candidate}" ] || continue
         [ -e "${candidate}" ] || continue
         resolved="$(readlink -f "${candidate}" 2>/dev/null || printf '%s' "${candidate}")"
 
-        if [ -n "${current_path}" ] && [ "${resolved}" = "${current_path}" ]; then
-            continue
-        fi
-        if [ -n "${shortcut_path}" ] && [ "${resolved}" = "${shortcut_path}" ]; then
-            continue
-        fi
-        if [ -n "${root_script_path}" ] && [ "${resolved}" = "${root_script_path}" ]; then
+        if printf '%s\n' "${keep_paths}" | grep -Fxq "${resolved}"; then
             continue
         fi
 
@@ -426,7 +433,7 @@ EOF
     warn "Old script files / legacy shortcuts found:"
     cat "${tmp_list}"
     echo
-    warn "This will not remove Snell, AnyTLS, certificates, configs, /root/snell.sh, or the hardy shortcut."
+    warn "This will not remove Snell, VLESS+Reality, AnyTLS, certificates, configs, /root/snell, or the hardy shortcut."
     read -rp "Delete the listed old script files now? [y/N]: " confirm
     if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
         rm -f "${tmp_list}"
@@ -3687,7 +3694,7 @@ show_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}        Snell + VLESS-Reality + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
-    echo -e "${CYAN}        githubh01/snell.sh${RESET}"
+    echo -e "${CYAN}        githubh01/snell${RESET}"
     echo -e "${CYAN}        Shortcut: hardy${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo "1. Snell management"

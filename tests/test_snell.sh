@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Static/functional test harness for snell.sh.
+# Static/functional test harness for the ./snell script.
 # Sources the script with main() disabled and paths redirected to a sandbox.
 
 set -uo pipefail
@@ -13,7 +13,10 @@ t_ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
 t_bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     -> %s\n' "$1" "${2:-}"; }
 check()  { if [ "$2" = "$3" ]; then t_ok "$1"; else t_bad "$1" "expected [$3] got [$2]"; fi; }
 
-sed 's/^main "\$@"$/: # disabled/' /home/user/snell/snell.sh > "$SANDBOX/lib.sh"
+# Resolve the script relative to this test file so the suite is location-independent.
+TARGET="$(cd "$(dirname "$0")/.." && pwd)/snell"
+[ -f "$TARGET" ] || { echo "Cannot find the snell script at $TARGET"; exit 1; }
+sed 's/^main "\$@"$/: # disabled/' "$TARGET" > "$SANDBOX/lib.sh"
 # shellcheck disable=SC1090
 source "$SANDBOX/lib.sh"
 

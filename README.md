@@ -13,9 +13,9 @@ It also has one-click BBR congestion control setup.
 Download the script to the server and run it as root:
 
 ```bash
-curl -fsSL -o /root/snell.sh https://raw.githubusercontent.com/githubh01/snell/main/snell.sh
-chmod +x /root/snell.sh
-sudo /root/snell.sh
+curl -fsSL -o /root/snell https://raw.githubusercontent.com/githubh01/snell/main/snell
+chmod +x /root/snell
+sudo /root/snell
 ```
 
 The first run installs a shortcut command, so afterwards you can just run:
@@ -23,6 +23,9 @@ The first run installs a shortcut command, so afterwards you can just run:
 ```bash
 sudo hardy
 ```
+
+If you previously saved this script as `/root/snell.sh`, that path still works —
+the shortcut installer accepts both names. Nothing needs to be reinstalled.
 
 ## What the menu offers
 
