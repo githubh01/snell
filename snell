@@ -2,6 +2,11 @@
 #
 # Snell + VLESS-Reality + AnyTLS management script for githubh01/snell
 #
+# SCRIPT-ID: snell-vless-reality-anytls-manager
+# The line above is how this script recognises its own copies on disk. It is
+# deliberately language-independent so translating the interface can never
+# break shortcut installation or the old-file cleanup.
+#
 # This script is self-contained by design:
 # - no remote shell execution
 # - no self-update from another repository
@@ -112,16 +117,16 @@ fail_step() {
     local logcmd="${4:-}"
 
     echo >&2
-    err "FAILED: ${step}"
-    err "Reason: ${cause}"
+    err "失败：${step}"
+    err "原因：${cause}"
     if [ -n "${hints}" ]; then
         echo >&2
-        warn "Things to check:"
+        warn "请检查以下几项："
         printf '%s\n' "${hints}" >&2
     fi
     if [ -n "${logcmd}" ]; then
         echo >&2
-        warn "Show the full log with:"
+        warn "查看完整日志："
         printf '  %s\n' "${logcmd}" >&2
     fi
     echo >&2
@@ -136,7 +141,7 @@ require_systemd() {
 - Containers without systemd (plain Docker, some LXC images) will not work."
         return 1
     fi
-    [ -d /run/systemd/system ] || warn "systemd does not look like PID 1; service management may fail."
+    [ -d /run/systemd/system ] || warn "systemd 似乎不是 PID 1，服务管理可能失败。"
     return 0
 }
 
@@ -183,10 +188,10 @@ backup_file() {
     stamp="$(date +%Y%m%d%H%M%S)"
     dest="${path}.bak.${stamp}"
     if cp -a "${path}" "${dest}" 2>/dev/null; then
-        ok "Backed up ${path} -> ${dest}"
+        ok "已备份 ${path} -> ${dest}"
         return 0
     fi
-    warn "Could not back up ${path}"
+    warn "无法备份 ${path}"
     return 0
 }
 
@@ -286,8 +291,8 @@ activate_and_verify() {
     if [ -n "${port}" ]; then
         port_is_listening "${port}"
         case "$?" in
-            0) ok "${label} is listening on port ${port}." ;;
-            2) warn "${label}: could not verify the listener (no ss/netstat/lsof available)." ;;
+            0) ok "${label} 已在端口 ${port} 上监听。" ;;
+            2) warn "${label}：无法验证端口监听（缺少 ss/netstat/lsof）。" ;;
             *)
                 journalctl -u "${unit}" --no-pager -n 30 >&2 || true
                 fail_step "${label} listener check" \
@@ -431,7 +436,7 @@ $(pwd 2>/dev/null)/hardy.sh
     script_path=""
     while IFS= read -r candidate; do
         [ -n "${candidate}" ] || continue
-        if [ -f "${candidate}" ] && grep -Eq 'Snell \+ (VLESS-Reality \+ )?AnyTLS Manager' "${candidate}" 2>/dev/null; then
+        if [ -f "${candidate}" ] && grep -Eq 'SCRIPT-ID: snell-vless-reality-anytls-manager|Snell \+ (VLESS-Reality \+ )?AnyTLS Manager' "${candidate}" 2>/dev/null; then
             script_path="${candidate}"
             break
         fi
@@ -440,17 +445,17 @@ ${candidates}
 EOF
 
     if [ -z "${script_path}" ]; then
-        warn "Could not install shortcut: script file was not found. Save this script as /root/snell and run it once, then command 'hardy' will work."
+        warn "无法安装快捷命令：未找到脚本文件。请把脚本保存为 /root/snell 并运行一次，之后即可使用 hardy 命令。"
         return 1
     fi
 
     mkdir -p "${INSTALL_DIR}"
     if install -m 0755 "${script_path}" "${SHORTCUT_PRIMARY}" 2>/dev/null; then
-        ok "Shortcut installed: hardy"
+        ok "快捷命令已安装：hardy"
         return 0
     fi
 
-    warn "Could not install shortcut to ${SHORTCUT_PRIMARY}."
+    warn "无法安装快捷命令到 ${SHORTCUT_PRIMARY}。"
     return 1
 }
 
@@ -506,8 +511,8 @@ $(readlink -f /root/snell.sh 2>/dev/null || true)"
             continue
         fi
 
-        if [ -f "${candidate}" ] && ! grep -Eq 'Snell \+ (VLESS-Reality \+ )?AnyTLS Manager|Snell management script|githubh01/snell|snell-menu|sat' "${candidate}" 2>/dev/null; then
-            warn "Skipped unrelated file: ${candidate}"
+        if [ -f "${candidate}" ] && ! grep -Eq 'SCRIPT-ID: snell-vless-reality-anytls-manager|Snell \+ (VLESS-Reality \+ )?AnyTLS Manager|Snell management script|githubh01/snell|snell-menu|sat' "${candidate}" 2>/dev/null; then
+            warn "已跳过无关文件：${candidate}"
             continue
         fi
 
@@ -518,15 +523,15 @@ EOF
 
     if [ ! -s "${tmp_list}" ]; then
         rm -f "${tmp_list}"
-        ok "No old script files or legacy shortcuts were found."
+        ok "未发现旧脚本文件或遗留快捷方式。"
         return 0
     fi
 
     echo
-    warn "Old script files / legacy shortcuts found:"
+    warn "发现以下旧脚本文件 / 遗留快捷方式："
     cat "${tmp_list}"
     echo
-    warn "This will not remove Snell, VLESS+Reality, AnyTLS, certificates, configs, /root/snell, or the hardy shortcut."
+    warn "不会删除 Snell、VLESS+Reality、AnyTLS、证书、配置、/root/snell 以及 hardy 快捷命令。"
     read -rp "Delete the listed old script files now? [y/N]: " confirm
     if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
         rm -f "${tmp_list}"
@@ -536,15 +541,15 @@ EOF
     while IFS= read -r candidate; do
         [ -n "${candidate}" ] || continue
         if rm -f -- "${candidate}" 2>/dev/null; then
-            ok "Removed: ${candidate}"
+            ok "已删除：${candidate}"
             removed=$((removed + 1))
         else
-            warn "Could not remove: ${candidate}"
+            warn "无法删除：${candidate}"
         fi
     done < "${tmp_list}"
 
     rm -f "${tmp_list}"
-    ok "Cleanup completed. Removed ${removed} old file(s)."
+    ok "清理完成，共删除 ${removed} 个旧文件。"
 }
 
 wait_for_apt() {
@@ -552,7 +557,7 @@ wait_for_apt() {
     local max_wait="${APT_LOCK_MAX_WAIT:-900}"
 
     while apt_is_busy; do
-        warn "Waiting for another apt/dpkg process..."
+        warn "正在等待其它 apt/dpkg 进程结束..."
         if [ $((waited % 30)) -eq 0 ]; then
             apt_lock_details
         fi
@@ -606,7 +611,7 @@ install_packages() {
 
     [ "${#missing[@]}" -eq 0 ] && return 0
 
-    warn "Missing dependencies: ${missing[*]}"
+    warn "缺少依赖：${missing[*]}"
 
     if has_command apt-get; then
         run_apt_get update
@@ -638,7 +643,7 @@ ensure_core_packages() {
     done
 
     if [ "${#missing[@]}" -gt 0 ]; then
-        warn "Installing additional dependencies: ${missing[*]}"
+        warn "正在安装附加依赖：${missing[*]}"
         if has_command apt-get; then
             run_apt_get install -y openssl jq ca-certificates iproute2
         elif has_command dnf; then
@@ -776,19 +781,19 @@ choose_snell_major() {
 
     {
         echo
-        info "Choose Snell major version:"
+        info "请选择 Snell 大版本："
         echo "1. Snell v4"
         echo "2. Snell v5"
-        echo "3. Snell v6 Beta"
+        echo "3. Snell v6 Beta（测试版）"
     } >&2
 
     while true; do
-        read -rp "Select [1-3]: " choice
+        read -rp "请选择 [1-3]: " choice
         case "${choice}" in
             1) printf 'v4'; return 0 ;;
             2) printf 'v5'; return 0 ;;
             3) printf 'v6'; return 0 ;;
-            *) err "Please enter 1, 2, or 3." ;;
+            *) err "请输入 1、2 或 3。" ;;
         esac
     done
 }
@@ -880,18 +885,18 @@ prompt_port() {
 
     while true; do
         if [ "${default_port}" = "random" ]; then
-            prompt="Listen port [Enter = random available port]: "
+            prompt="监听端口 [回车 = 随机可用端口]: "
         else
-            prompt="Listen port [default ${default_port}]: "
+            prompt="监听端口 [默认 ${default_port}]: "
         fi
         read -rp "${prompt}" port
         if [ -z "${port}" ] && [ "${default_port}" = "random" ]; then
             port="$(random_available_port)"
-            echo "Using random port: ${port}" >&2
+            echo "已随机选择端口：${port}" >&2
         fi
         port="${port:-${default_port}}"
         if ! valid_port "${port}"; then
-            err "Port must be a number between 1 and 65535."
+            err "端口必须是 1-65535 之间的数字。"
             continue
         fi
         printf '%s' "${port}"
@@ -901,7 +906,7 @@ prompt_port() {
 
 prompt_dns() {
     local dns
-    read -rp "DNS servers [default 1.1.1.1,8.8.8.8]: " dns
+    read -rp "DNS 服务器 [默认 1.1.1.1,8.8.8.8]: " dns
     printf '%s' "${dns:-1.1.1.1,8.8.8.8}"
 }
 
@@ -976,8 +981,8 @@ install_binary() {
 
     tmpdir="$(mktemp -d)"
 
-    info "Downloading Snell ${version} (${arch})..."
-    warn "Source: ${url}"
+    info "正在下载 Snell ${version}（${arch}）..."
+    warn "下载源：${url}"
 
     if ! download_to "${url}" "${tmpdir}/snell.zip" "Snell"; then
         rm -rf "${tmpdir}"
@@ -1017,7 +1022,7 @@ install_binary() {
         return 1
     fi
 
-    ok "Installed and verified: ${SNELL_BIN} ($("${SNELL_BIN}" --v 2>&1 | head -n1))"
+    ok "已安装并校验通过：${SNELL_BIN}（$("${SNELL_BIN}" --v 2>&1 | head -n1)）"
     return 0
 }
 
@@ -1027,12 +1032,12 @@ migrate_legacy_snell_config() {
     [ -f "${MAIN_CONF}" ] && return 0
     [ -f "${SNELL_LEGACY_CONF}" ] || return 0
 
-    info "Found a legacy config at ${SNELL_LEGACY_CONF}; migrating it."
+    info "发现旧版配置 ${SNELL_LEGACY_CONF}，正在迁移。"
     mkdir -p "${USERS_DIR}"
     cp -a "${SNELL_LEGACY_CONF}" "${MAIN_CONF}"
     chmod 640 "${MAIN_CONF}"
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "${MAIN_CONF}" 2>/dev/null || true
-    ok "Migrated ${SNELL_LEGACY_CONF} -> ${MAIN_CONF} (the original was kept)."
+    ok "已迁移 ${SNELL_LEGACY_CONF} -> ${MAIN_CONF}（原文件保留）。"
     return 0
 }
 
@@ -1156,7 +1161,7 @@ print_one_config() {
     echo "Installed Snell server: ${major}"
 
     if [ "${major}" = "unknown" ]; then
-        warn "Could not detect the installed Snell version; showing the v4 line only."
+        warn "无法识别已安装的 Snell 版本，仅输出 v4 配置行。"
     fi
 
     echo "Surge configuration line(s):"
@@ -1169,7 +1174,7 @@ show_config() {
     local file
 
     if [ ! -d "${USERS_DIR}" ]; then
-        warn "Config directory not found: ${USERS_DIR}"
+        warn "未找到配置目录：${USERS_DIR}"
         return 0
     fi
 
@@ -1193,10 +1198,10 @@ snell_verify_client_match() {
     psk="$(snell_main_psk)"
 
     if [ -z "${port}" ] || [ -z "${psk}" ]; then
-        warn "Could not read port/PSK back from ${MAIN_CONF}."
+        warn "无法从 ${MAIN_CONF} 读回端口/PSK。"
         return 1
     fi
-    ok "Client output matches the server config (port ${port}, PSK from ${MAIN_CONF})."
+    ok "客户端信息与服务端配置一致（端口 ${port}，PSK 来自 ${MAIN_CONF}）。"
     return 0
 }
 
@@ -1208,13 +1213,13 @@ snell_existing_config_choice() {
 
     {
         echo
-        warn "An existing Snell config was found: ${MAIN_CONF}"
-        echo "1. Keep the current config and continue (recommended)"
-        echo "2. Back it up, then generate a new port/PSK"
-        echo "3. Show the current config, then decide"
-        echo "0. Cancel"
+        warn "检测到已有 Snell 配置：${MAIN_CONF}"
+        echo "1. 保留当前配置并继续（推荐）"
+        echo "2. 备份后重新生成端口和 PSK"
+        echo "3. 先查看当前配置再决定"
+        echo "0. 取消"
     } >&2
-    read -rp "Select [0-3]: " choice
+    read -rp "请选择 [0-3]: " choice
 
     case "${choice}" in
         1) printf 'keep' ;;
@@ -1233,7 +1238,7 @@ install_snell() {
 
     state="$(snell_state)"
     if [ "${state}" != "not_installed" ]; then
-        info "Snell is already present (state: ${state})."
+        info "Snell 已安装（状态：${state}）。"
     fi
 
     if ! selected="$(choose_snell_major)"; then
@@ -1252,13 +1257,13 @@ install_snell() {
 
         case "${decision}" in
             cancel)
-                info "Cancelled. The binary was updated; the config was left untouched."
+                info "已取消。程序已更新，配置未改动。"
                 return 0
                 ;;
             keep)
                 write_service
                 if activate_and_verify "snell" "$(snell_main_port)" "Snell"; then
-                    ok "Snell is running with the existing config."
+                    ok "Snell 已使用现有配置启动。"
                     show_config
                     snell_verify_client_match || true
                     return 0
@@ -1279,7 +1284,7 @@ install_snell() {
 
     activate_and_verify "snell" "${port}" "Snell" || return 1
 
-    ok "Snell installation completed."
+    ok "Snell 安装完成。"
     show_config
     snell_verify_client_match || true
     return 0
@@ -1298,8 +1303,8 @@ update_snell() {
         return 1
     fi
 
-    info "Current installed version: $(snell_installed_major)"
-    info "This updates the binary only; port, PSK and DNS are preserved."
+    info "当前已安装版本：$(snell_installed_major)"
+    info "仅升级程序，端口、PSK、DNS 全部保留。"
 
     if ! selected="$(choose_snell_major)"; then
         return 1
@@ -1307,8 +1312,8 @@ update_snell() {
     install_binary "${selected}" || return 1
 
     if ! snell_config_is_valid; then
-        warn "The existing config is missing or incomplete; not starting the service."
-        warn "Run 'Install / reinstall' to create a config."
+        warn "现有配置缺失或不完整，不启动服务。"
+        warn "请运行「安装 / 重装」来创建配置。"
         return 1
     fi
 
@@ -1316,7 +1321,7 @@ update_snell() {
     port="$(snell_main_port)"
     activate_and_verify "snell" "${port}" "Snell" || return 1
 
-    ok "Snell binary update completed; the existing config was preserved."
+    ok "Snell 程序升级完成，原配置已保留。"
     show_config
     snell_verify_client_match || true
     return 0
@@ -1345,7 +1350,7 @@ snell_repair() {
     port="$(snell_main_port)"
     activate_and_verify "snell" "${port}" "Snell" || return 1
 
-    ok "Snell service repaired; settings unchanged."
+    ok "Snell 服务已修复，设置未改动。"
     show_config
     return 0
 }
@@ -1355,29 +1360,29 @@ uninstall_snell() {
 
     require_root
     if ! snell_is_installed; then
-        warn "Snell is not installed."
+        warn "Snell 尚未安装。"
         return 0
     fi
 
-    warn "This removes only files created by this module:"
+    warn "只会删除本模块自己创建的文件："
     echo "  ${SNELL_BIN}"
     echo "  ${SERVICE_FILE}"
     echo "  ${SNELL_DIR} (optional)"
-    read -rp "Confirm uninstall? [y/N]: " confirm
+    read -rp "确认卸载？[y/N]: " confirm
     [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
 
     systemctl disable --now snell 2>/dev/null || true
     rm -f "${SERVICE_FILE}" "${SNELL_BIN}"
     systemctl daemon-reload 2>/dev/null || true
 
-    read -rp "Also remove the config directory ${SNELL_DIR}? [y/N]: " remove_conf
+    read -rp "同时删除配置目录 ${SNELL_DIR}？[y/N]: " remove_conf
     if [[ "${remove_conf}" =~ ^[Yy]$ ]]; then
         rm -rf "${SNELL_DIR}"
     else
-        info "Config kept at ${SNELL_DIR}"
+        info "配置已保留在 ${SNELL_DIR}"
     fi
 
-    ok "Snell uninstalled. VLESS+Reality and AnyTLS were not touched."
+    ok "Snell 已卸载，VLESS+Reality 和 AnyTLS 未受影响。"
 }
 
 restart_snell() {
@@ -1390,36 +1395,36 @@ restart_snell() {
     fi
 
     activate_and_verify "snell" "$(snell_main_port)" "Snell" || return 1
-    ok "Snell restarted."
+    ok "Snell 已重启。"
 }
 
 service_status() {
     local port
 
     if ! snell_is_installed; then
-        warn "Snell is not installed."
+        warn "Snell 尚未安装。"
         return 0
     fi
 
     echo
     ok "Snell"
-    echo "State: $(snell_state)"
-    echo "Installed version: $(snell_installed_major)"
-    echo "Port: $(snell_main_port)"
+    echo "状态：$(snell_state)"
+    echo "已安装版本：$(snell_installed_major)"
+    echo "端口：$(snell_main_port)"
 
     if service_is_active snell; then
-        echo "Service: running"
+        echo "服务：运行中"
     else
-        echo "Service: stopped"
+        echo "服务：已停止"
     fi
 
     port="$(snell_main_port)"
     if [ -n "${port}" ]; then
         port_is_listening "${port}" 1
         case "$?" in
-            0) echo "Listener: port ${port} is listening" ;;
-            2) warn "Listener: cannot verify (install iproute2 for 'ss')" ;;
-            *) warn "Listener: nothing is listening on port ${port}" ;;
+            0) echo "端口监听：${port} 正在监听" ;;
+            2) warn "端口监听：无法验证（安装 iproute2 可启用 ss 检测）" ;;
+            *) warn "端口监听：端口 ${port} 上没有任何监听" ;;
         esac
     fi
 
@@ -1479,7 +1484,7 @@ change_snell_psk() {
     port="$(snell_main_port)"
     dns="$(snell_main_dns)"
     dns="${dns:-1.1.1.1,8.8.8.8}"
-    read -rp "New PSK [press Enter to generate]: " psk
+    read -rp "新的 PSK [回车自动生成]: " psk
     psk="${psk:-$(random_psk)}"
 
     backup_file "${MAIN_CONF}"
@@ -1495,24 +1500,24 @@ snell_menu() {
     while true; do
         clear
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}        Snell Manager${RESET}"
+        echo -e "${CYAN}        Snell 管理${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo "1. Install / reinstall Snell"
-        echo "2. Update Snell binary (keeps port and PSK)"
-        echo "3. Show config"
-        echo "4. Change main port"
-        echo "5. Change main PSK"
-        echo "6. Repair service (rebuild unit, keep settings)"
-        echo "7. Restart service"
-        echo "8. Start service"
-        echo "9. Stop service"
-        echo "10. Show service status"
-        echo "11. Show logs"
-        echo "12. User config management"
-        echo "13. Uninstall Snell"
-        echo "0. Back"
+        echo "1. 安装 / 重装 Snell"
+        echo "2. 升级 Snell 程序（保留端口和 PSK）"
+        echo "3. 查看配置"
+        echo "4. 修改主端口"
+        echo "5. 修改主 PSK"
+        echo "6. 修复服务（重建服务文件，保留设置）"
+        echo "7. 重启服务"
+        echo "8. 启动服务"
+        echo "9. 停止服务"
+        echo "10. 查看服务状态"
+        echo "11. 查看日志"
+        echo "12. 多用户配置管理"
+        echo "13. 卸载 Snell"
+        echo "0. 返回上级"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-13]: " choice
+        read -rp "请选择 [0-13]: " choice
         case "${choice}" in
             1) install_snell || true ;;
             2) update_snell || true ;;
@@ -1528,10 +1533,10 @@ snell_menu() {
             12) user_menu ;;
             13) uninstall_snell ;;
             0) return 0 ;;
-            *) err "Invalid option." ;;
+            *) err "无效选项。" ;;
         esac
         echo
-        read -rp "Press Enter to return to the Snell menu..." _
+        read -rp "按回车返回 Snell 菜单..." _
     done
 }
 
@@ -1550,7 +1555,7 @@ show_bbr_status() {
     fi
 
     echo
-    info "BBR status"
+    info "BBR 状态"
     echo "tcp_bbr module: ${module_state}"
     echo "tcp_congestion_control: ${cc:-unknown}"
     echo "default_qdisc: ${qdisc:-unknown}"
@@ -1569,17 +1574,17 @@ enable_bbr() {
     current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
     if [ "${current_cc}" = "bbr" ] && [ "${current_qdisc}" = "fq" ]; then
-        ok "BBR is already active. No runtime change is needed."
+        ok "BBR 已在生效，无需改动。"
         read -rp "Ensure BBR is persisted in ${conf}? [y/N]: " confirm
         [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
     else
-        warn "This will enable BBR by updating ${conf} and running sysctl -p."
+        warn "将修改 ${conf} 并执行 sysctl -p 来启用 BBR。"
         read -rp "Enable BBR now? [y/N]: " confirm
         [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
     fi
 
     if ! modprobe tcp_bbr 2>/dev/null; then
-        warn "Could not load tcp_bbr with modprobe. The kernel may not support BBR, or it may already be built in."
+        warn "modprobe 加载 tcp_bbr 失败。内核可能不支持 BBR，或已内置。"
     fi
 
     if [ -e "${conf}" ] && [ ! -f "${conf}" ]; then
@@ -1603,14 +1608,14 @@ enable_bbr() {
         echo "net.ipv4.tcp_congestion_control = bbr"
     } >> "${conf}"
 
-    sysctl -p "${conf}" >/dev/null || warn "sysctl -p failed. Please check kernel support and ${conf}."
+    sysctl -p "${conf}" >/dev/null || warn "sysctl -p 执行失败，请检查内核支持和 ${conf}。"
 
     show_bbr_status
 
     if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = "bbr" ]; then
-        ok "BBR is enabled."
+        ok "BBR 已启用。"
     else
-        warn "BBR is not active yet. A reboot or newer kernel may be required."
+        warn "BBR 尚未生效，可能需要重启或更新内核。"
     fi
 }
 
@@ -1675,8 +1680,8 @@ install_sing_box_binary() {
     url="https://github.com/SagerNet/sing-box/releases/download/${version}/${name}.tar.gz"
     tmpdir="$(mktemp -d)"
 
-    info "Downloading sing-box ${version} (${arch})..."
-    warn "Source: ${url}"
+    info "正在下载 sing-box ${version}（${arch}）..."
+    warn "下载源：${url}"
 
     if ! download_to "${url}" "${tmpdir}/sing-box.tar.gz" "sing-box"; then
         rm -rf "${tmpdir}"
@@ -1718,7 +1723,7 @@ install_sing_box_binary() {
     fi
 
     SING_BOX_DOWNLOADED_VERSION="${version}"
-    ok "sing-box ${version} verified at ${dest}"
+    ok "sing-box ${version} 已安装并校验通过：${dest}"
     return 0
 }
 
@@ -1732,7 +1737,7 @@ sing_box_check_config() {
 
     if ! output="$("${bin}" check -c "${config}" 2>&1)"; then
         echo >&2
-        err "sing-box rejected the generated config:"
+        err "sing-box 拒绝了生成的配置："
         printf '%s\n' "${output}" >&2
         fail_step "${label} config validation" \
             "sing-box check failed for ${config}" \
@@ -1741,7 +1746,7 @@ sing_box_check_config() {
             "${bin} check -c ${config}"
         return 1
     fi
-    ok "${label} config validated by sing-box."
+    ok "${label} 配置已通过 sing-box 校验。"
     return 0
 }
 
@@ -1788,17 +1793,17 @@ anytls_prompt_port() {
     local input
 
     while true; do
-        echo "Press Enter for a random available port, or enter a custom port [1-65535]." >&2
-        read -rp "AnyTLS port: " input
+        echo "回车使用随机可用端口，或自定义端口 [1-65535]。" >&2
+        read -rp "AnyTLS 端口: " input
         if [ -z "${input:-}" ]; then
             input="$(anytls_random_port)"
         fi
         if ! valid_port "${input}"; then
-            err "Invalid port: ${input}"
+            err "无效端口：${input}"
             continue
         fi
         if is_port_used "${input}"; then
-            err "Port ${input} is already in use."
+            err "端口 ${input} 已被占用。"
             continue
         fi
         echo "${input}"
@@ -1957,11 +1962,11 @@ anytls_ensure_self_signed_cert() {
     chmod 700 "${ANYTLS_DIR}" "${ANYTLS_CERT_DIR}" 2>/dev/null || true
 
     if [ "${force}" != "true" ] && [ -s "${ANYTLS_SELF_CERT}" ] && [ -s "${ANYTLS_SELF_KEY}" ]; then
-        info "Reusing the existing self-signed certificate."
+        info "复用已有的自签证书。"
         return 0
     fi
 
-    info "Generating a self-signed certificate (CN=${ANYTLS_SELF_CN})..."
+    info "正在生成自签证书（CN=${ANYTLS_SELF_CN}）..."
 
     if ! openssl ecparam -genkey -name prime256v1 -out "${ANYTLS_SELF_KEY}" 2>/dev/null; then
         fail_step "self-signed key generation" "openssl could not create an EC private key." \
@@ -1988,7 +1993,7 @@ anytls_ensure_self_signed_cert() {
         return 1
     fi
 
-    ok "Self-signed certificate ready."
+    ok "自签证书已就绪。"
     return 0
 }
 
@@ -2026,12 +2031,12 @@ anytls_validate_cert_pair() {
 
     if [ -n "${domain}" ]; then
         if ! openssl x509 -in "${cert}" -noout -text 2>/dev/null | grep -qi -- "${domain}"; then
-            warn "Certificate does not appear to mention ${domain}. Clients may reject it."
+            warn "证书中似乎不含 ${domain}，客户端可能拒绝。"
         fi
     fi
 
     if ! openssl x509 -in "${cert}" -noout -checkend 0 >/dev/null 2>&1; then
-        warn "Certificate is already expired."
+        warn "证书已过期。"
     fi
 
     return 0
@@ -2046,7 +2051,7 @@ anytls_acme_preflight() {
     local method="$2"
     local resolved4 resolved6 public4 public6 problems=0
 
-    info "Running certificate pre-flight checks for ${domain}..."
+    info "正在对 ${domain} 做证书申请前置检查..."
 
     if ! is_valid_domain "${domain}"; then
         fail_step "certificate pre-flight" "Not a valid domain name: ${domain}" \
@@ -2077,7 +2082,7 @@ anytls_acme_preflight() {
             "getent ahosts ${domain}"
         return 1
     fi
-    ok "DNS resolves ${domain} -> ${resolved4:-${resolved6}}"
+    ok "DNS 解析正常：${domain} -> ${resolved4:-${resolved6}}"
 
     public4="$(detect_public_ipv4)"
     public6="$(detect_public_ipv6)"
@@ -2106,7 +2111,7 @@ anytls_acme_preflight() {
                 "ss -tlnp | grep ':80 '"
             return 1
         fi
-        ok "Port 80 is free and ${domain} points here."
+        ok "80 端口空闲，且 ${domain} 已指向本机。"
     fi
 
     # ACME endpoint reachability.
@@ -2118,7 +2123,7 @@ anytls_acme_preflight() {
             "curl -v https://acme-v02.api.letsencrypt.org/directory"
         return 1
     fi
-    ok "ACME API is reachable."
+    ok "可以访问 ACME 接口。"
 
     return 0
 }
@@ -2146,7 +2151,7 @@ certbot_issue_standalone() {
         account_args=(--register-unsafely-without-email)
     fi
 
-    info "Requesting a certificate for ${domain} via HTTP-01..."
+    info "正在通过 HTTP-01 为 ${domain} 申请证书..."
     output="$(certbot certonly --standalone --non-interactive --agree-tos \
         --preferred-challenges http \
         "${account_args[@]}" \
@@ -2202,7 +2207,7 @@ certbot_issue_cloudflare() {
         account_args=(--register-unsafely-without-email)
     fi
 
-    info "Requesting a certificate for ${domain} via Cloudflare DNS-01..."
+    info "正在通过 Cloudflare DNS-01 为 ${domain} 申请证书..."
     output="$(certbot certonly --dns-cloudflare \
         --dns-cloudflare-credentials "${CF_CERTBOT_CREDENTIALS}" \
         --dns-cloudflare-propagation-seconds "${propagation}" \
@@ -2356,12 +2361,12 @@ anytls_client_export() {
     local port password host mode domain sni insecure query alias_enc link link_enc
 
     if [ ! -s "${ANYTLS_JSON}" ]; then
-        err "AnyTLS config not found: ${ANYTLS_JSON}"
+        err "未找到 AnyTLS 配置：${ANYTLS_JSON}"
         return 1
     fi
 
-    port="$(anytls_cfg_port)" || { err "Could not read listen_port from ${ANYTLS_JSON}"; return 1; }
-    password="$(anytls_cfg_password)" || { err "Could not read password from ${ANYTLS_JSON}"; return 1; }
+    port="$(anytls_cfg_port)" || { err "无法从 ${ANYTLS_JSON} 读取 listen_port"; return 1; }
+    password="$(anytls_cfg_password)" || { err "无法从 ${ANYTLS_JSON} 读取 password"; return 1; }
     sni="$(anytls_cfg_sni 2>/dev/null || true)"
     mode="$(anytls_mode)"
     domain="$(anytls_domain 2>/dev/null || true)"
@@ -2384,8 +2389,8 @@ anytls_client_export() {
 
     mkdir -p "${ANYTLS_DIR}"
     cat > "${ANYTLS_CLIENT_FILE}" <<EOF
-AnyTLS client parameters
-(read back from ${ANYTLS_JSON})
+AnyTLS 客户端参数
+（读取自 ${ANYTLS_JSON}）
 TLS mode: ${mode}
 Address: ${host}
 Port: ${port}
@@ -2399,12 +2404,12 @@ EOF
     chmod 600 "${ANYTLS_CLIENT_FILE}"
 
     echo
-    ok "AnyTLS client parameters"
+    ok "AnyTLS 客户端参数"
     cat "${ANYTLS_CLIENT_FILE}"
     if [ "${mode}" != "acme" ]; then
         echo
-        warn "Self-signed mode: the client MUST skip certificate verification"
-        warn "(insecure / allowInsecure / 'Allow insecure' = on)."
+        warn "自签证书模式：客户端必须开启「跳过证书验证」"
+        warn "（insecure / allowInsecure / 允许不安全 = 开）。"
     fi
     return 0
 }
@@ -2420,10 +2425,10 @@ anytls_verify_client_match() {
     grep -q ":${port}?" "${ANYTLS_CLIENT_FILE}" || mismatch=1
 
     if [ "${mismatch}" -ne 0 ]; then
-        warn "Client link does not match the server config; regenerate it from the AnyTLS menu."
+        warn "分享链接与服务端配置不一致，请在 AnyTLS 菜单重新生成。"
         return 1
     fi
-    ok "Client link matches the server config (password, port)."
+    ok "分享链接与服务端配置一致（密码、端口）。"
     return 0
 }
 
@@ -2440,7 +2445,7 @@ anytls_apply() {
     sing_box_check_config "${ANYTLS_SING_BOX_BIN}" "${ANYTLS_JSON}" "AnyTLS" || return 1
     activate_and_verify "${ANYTLS_SERVICE_NAME}" "${port}" "AnyTLS" || return 1
 
-    ok "AnyTLS is running on port ${port} (${mode} certificate)."
+    ok "AnyTLS 已在端口 ${port} 上运行（证书模式：${mode}）。"
     anytls_client_export || return 1
     anytls_verify_client_match || true
     return 0
@@ -2450,12 +2455,12 @@ anytls_apply() {
 anytls_migrate_legacy() {
     anytls_has_legacy_layout || return 0
 
-    warn "Detected the older anytls-go layout; migrating this module to sing-box."
+    warn "检测到旧版 anytls-go 结构，正在迁移到 sing-box。"
     systemctl disable --now "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
     backup_file "${ANYTLS_CONFIG}"
     backup_file "${ANYTLS_LEGACY_SING_BOX_CONFIG}"
     rm -f "${ANYTLS_BIN}"
-    ok "Legacy AnyTLS files backed up; the anytls-go binary was removed."
+    ok "旧版 AnyTLS 文件已备份，anytls-go 程序已移除。"
     return 0
 }
 
@@ -2490,12 +2495,12 @@ anytls_install_self_signed() {
     state="$(anytls_state)"
     if [ "${state}" != "not_installed" ]; then
         echo
-        warn "AnyTLS is already present (state: ${state})."
-        echo "1. Keep the existing port and password; rebuild with a self-signed certificate"
-        echo "2. Back up the current config, then generate a completely new one"
-        echo "3. Show the current client config"
-        echo "0. Cancel"
-        read -rp "Select [0-3]: " choice
+        warn "AnyTLS 已安装（状态：${state}）。"
+        echo "1. 保留现有端口和密码，用自签证书重建"
+        echo "2. 备份当前配置，然后全新生成"
+        echo "3. 查看当前客户端配置"
+        echo "0. 取消"
+        read -rp "请选择 [0-3]: " choice
         case "${choice}" in
             1)
                 recovered="$(anytls_recover_port_password)"
@@ -2507,7 +2512,7 @@ anytls_install_self_signed() {
                 backup_file "${ANYTLS_PARAMS_FILE}"
                 ;;
             3) anytls_client_export; return $? ;;
-            *) info "Cancelled."; return 0 ;;
+            *) info "已取消。"; return 0 ;;
         esac
     fi
 
@@ -2519,12 +2524,12 @@ anytls_install_self_signed() {
     if [ -z "${port:-}" ]; then
         port="$(anytls_prompt_port)"
     else
-        info "Reusing existing port ${port}."
+        info "沿用现有端口 ${port}。"
     fi
     if [ -z "${password:-}" ]; then
         password="$(anytls_password)"
     else
-        info "Reusing existing password."
+        info "沿用现有密码。"
     fi
 
     anytls_ensure_self_signed_cert false || return 1
@@ -2558,7 +2563,7 @@ anytls_finish_with_cert() {
     if [ -z "${port}" ]; then
         port="$(anytls_prompt_port)"
     else
-        info "Reusing existing port ${port}."
+        info "沿用现有端口 ${port}。"
     fi
     [ -n "${password}" ] || password="$(anytls_password)"
 
@@ -2571,13 +2576,13 @@ anytls_offer_self_signed_fallback() {
     local choice
 
     echo
-    warn "The real-certificate path did not complete."
-    read -rp "Fall back to self-signed mode so AnyTLS still works? [y/N]: " choice
+    warn "真实证书流程未完成。"
+    read -rp "是否回退到自签证书模式以保证 AnyTLS 可用？[y/N]: " choice
     if [[ "${choice}" =~ ^[Yy]$ ]]; then
         anytls_install_self_signed
         return $?
     fi
-    info "No fallback performed. AnyTLS was left unchanged."
+    info "未执行回退，AnyTLS 保持原样。"
     return 1
 }
 
@@ -2587,15 +2592,15 @@ anytls_install_with_acme_cert() {
     preflight_common "AnyTLS" || return 1
 
     echo
-    info "Real certificate via HTTP-01 (certbot standalone)."
-    warn "Your domain must already point at this server and port 80 must be reachable."
-    read -rp "Domain for the AnyTLS certificate: " domain
+    info "使用 HTTP-01 申请真实证书（certbot standalone）。"
+    warn "域名必须已解析到本机，且 80 端口可从外部访问。"
+    read -rp "AnyTLS 证书使用的域名: " domain
     if ! is_valid_domain "${domain}"; then
         fail_step "AnyTLS certificate setup" "Not a valid domain: ${domain}"
         return 1
     fi
-    read -rp "Email for Let's Encrypt notices [Enter = none]: " email
-    read -rp "Use the Let's Encrypt staging (test) certificate? [y/N]: " staging_choice
+    read -rp "Let's Encrypt 通知邮箱 [回车 = 不填]: " email
+    read -rp "是否使用 Let's Encrypt 测试证书？[y/N]: " staging_choice
     [[ "${staging_choice}" =~ ^[Yy]$ ]] && staging="true"
 
     if ! anytls_acme_preflight "${domain}" "http"; then
@@ -2617,32 +2622,32 @@ anytls_install_with_cloudflare_cert() {
     preflight_common "AnyTLS" || return 1
 
     echo
-    info "Real certificate via Cloudflare DNS-01."
-    warn "Port 80 is not needed. Create a token with Zone:DNS:Edit and Zone:Zone:Read."
-    read -rp "Domain for the AnyTLS certificate: " domain
+    info "使用 Cloudflare DNS-01 申请真实证书。"
+    warn "不需要 80 端口。请创建具备 Zone:DNS:Edit 和 Zone:Zone:Read 权限的 API 令牌。"
+    read -rp "AnyTLS 证书使用的域名: " domain
     if ! is_valid_domain "${domain}"; then
         fail_step "AnyTLS certificate setup" "Not a valid domain: ${domain}"
         return 1
     fi
-    read -rp "Email for Let's Encrypt notices [Enter = none]: " email
+    read -rp "Let's Encrypt 通知邮箱 [回车 = 不填]: " email
     if [ -f "${CF_CERTBOT_CREDENTIALS}" ]; then
-        read -rsp "Cloudflare API token [Enter = reuse saved token]: " token
+        read -rsp "Cloudflare API 令牌 [回车 = 使用已保存的]: " token
         echo
     else
-        read -rsp "Cloudflare API token: " token
+        read -rsp "Cloudflare API 令牌: " token
         echo
         if [ -z "${token}" ]; then
             fail_step "AnyTLS certificate setup" "A Cloudflare API token is required."
             return 1
         fi
     fi
-    read -rp "DNS propagation wait seconds [Enter = 60]: " propagation
+    read -rp "DNS 生效等待秒数 [回车 = 60]: " propagation
     propagation="${propagation:-60}"
     if ! [[ "${propagation}" =~ ^[0-9]+$ ]]; then
         fail_step "AnyTLS certificate setup" "Invalid propagation seconds: ${propagation}"
         return 1
     fi
-    read -rp "Use the Let's Encrypt staging (test) certificate? [y/N]: " staging_choice
+    read -rp "是否使用 Let's Encrypt 测试证书？[y/N]: " staging_choice
     [[ "${staging_choice}" =~ ^[Yy]$ ]] && staging="true"
 
     # DNS-01 does not need the record to point here, so skip that check.
@@ -2664,7 +2669,7 @@ anytls_apply_existing_cert() {
 
     preflight_common "AnyTLS" || return 1
 
-    read -rp "Existing Let's Encrypt domain to apply: " domain
+    read -rp "要使用的已有 Let's Encrypt 证书域名: " domain
     if ! is_valid_domain "${domain}"; then
         fail_step "AnyTLS certificate setup" "Not a valid domain: ${domain}"
         return 1
@@ -2693,7 +2698,7 @@ anytls_update() {
     fi
 
     if [ ! -s "${ANYTLS_JSON}" ]; then
-        warn "No sing-box AnyTLS config present; running a self-signed install instead."
+        warn "未找到 sing-box 版 AnyTLS 配置，改为执行自签安装。"
         anytls_install_self_signed
         return $?
     fi
@@ -2706,7 +2711,7 @@ anytls_update() {
     mode="$(anytls_mode)"
     domain="$(anytls_domain 2>/dev/null || true)"
 
-    info "Updating sing-box while keeping the existing port, password and certificate."
+    info "正在升级 sing-box，端口、密码、证书保持不变。"
     install_sing_box_binary "${ANYTLS_SING_BOX_BIN}" || return 1
     version="${SING_BOX_DOWNLOADED_VERSION}"
 
@@ -2735,7 +2740,7 @@ anytls_change_value() {
 
     case "${field}" in
         port)     port="$(anytls_prompt_port)" ;;
-        password) password="$(anytls_password)"; info "New password: ${password}" ;;
+        password) password="$(anytls_password)"; info "新的密码：${password}" ;;
         *) fail_step "AnyTLS change" "Unknown field: ${field}"; return 1 ;;
     esac
 
@@ -2772,53 +2777,53 @@ anytls_uninstall() {
 
     require_root
     if ! anytls_is_installed; then
-        warn "AnyTLS is not installed."
+        warn "AnyTLS 尚未安装。"
         return 0
     fi
 
-    warn "This removes only files created by this module:"
+    warn "只会删除本模块自己创建的文件："
     echo "  ${ANYTLS_DIR}"
     echo "  ${ANYTLS_SERVICE_FILE}"
-    warn "Let's Encrypt certificates under /etc/letsencrypt are NOT removed."
-    read -rp "Uninstall AnyTLS? [y/N]: " confirm
+    warn "/etc/letsencrypt 下的证书不会被删除。"
+    read -rp "确认卸载 AnyTLS？[y/N]: " confirm
     [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
 
     systemctl disable --now "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
     rm -f "${ANYTLS_SERVICE_FILE}"
     rm -rf "${ANYTLS_DIR}"
     systemctl daemon-reload 2>/dev/null || true
-    ok "AnyTLS uninstalled. Snell and VLESS+Reality were not touched."
+    ok "AnyTLS 已卸载，Snell 和 VLESS+Reality 未受影响。"
 }
 
 anytls_status() {
     local port
 
     if ! anytls_is_installed; then
-        warn "AnyTLS is not installed."
+        warn "AnyTLS 尚未安装。"
         return 0
     fi
 
     echo
     ok "AnyTLS"
-    echo "State: $(anytls_state)"
-    echo "sing-box version: $(anytls_installed_version)"
-    echo "TLS mode: $(anytls_mode)"
-    echo "Domain: $(anytls_domain 2>/dev/null || echo none)"
-    echo "Port: $(anytls_cfg_port 2>/dev/null || echo unknown)"
+    echo "状态：$(anytls_state)"
+    echo "sing-box 版本：$(anytls_installed_version)"
+    echo "证书模式：$(anytls_mode)"
+    echo "域名：$(anytls_domain 2>/dev/null || echo 无)"
+    echo "端口：$(anytls_cfg_port 2>/dev/null || echo 未知)"
 
     if anytls_is_active; then
-        echo "Service: running"
+        echo "服务：运行中"
     else
-        echo "Service: stopped"
+        echo "服务：已停止"
     fi
 
     port="$(anytls_cfg_port 2>/dev/null || true)"
     if [ -n "${port}" ]; then
         port_is_listening "${port}" 1
         case "$?" in
-            0) echo "Listener: port ${port} is listening" ;;
-            2) warn "Listener: cannot verify (install iproute2 for 'ss')" ;;
-            *) warn "Listener: nothing is listening on port ${port}" ;;
+            0) echo "端口监听：${port} 正在监听" ;;
+            2) warn "端口监听：无法验证（安装 iproute2 可启用 ss 检测）" ;;
+            *) warn "端口监听：端口 ${port} 上没有任何监听" ;;
         esac
     fi
 
@@ -2827,14 +2832,14 @@ anytls_status() {
 
 anytls_start() {
     require_root
-    anytls_is_installed || { warn "AnyTLS is not installed."; return 0; }
+    anytls_is_installed || { warn "AnyTLS 尚未安装。"; return 0; }
     systemctl start "${ANYTLS_SERVICE_NAME}"
     anytls_status
 }
 
 anytls_stop() {
     require_root
-    anytls_is_installed || { warn "AnyTLS is not installed."; return 0; }
+    anytls_is_installed || { warn "AnyTLS 尚未安装。"; return 0; }
     systemctl stop "${ANYTLS_SERVICE_NAME}"
     anytls_status
 }
@@ -2849,28 +2854,28 @@ anytls_menu() {
     while true; do
         clear
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}        AnyTLS Manager${RESET}"
+        echo -e "${CYAN}        AnyTLS 管理${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo "-- TLS mode 1: self-signed (no domain needed) --"
-        echo "1. Install / reinstall with a self-signed certificate"
-        echo "-- TLS mode 2: real certificate for your domain --"
-        echo "2. Issue via HTTP-01 (needs port 80 + DNS pointing here)"
-        echo "3. Issue via Cloudflare DNS-01 (no port 80 needed)"
-        echo "4. Use a certificate already issued on this server"
-        echo "5. Renew certificates now"
-        echo "-- Management --"
-        echo "6. Update sing-box (keeps port, password, certificate)"
-        echo "7. Show client config"
-        echo "8. Change port"
-        echo "9. Change password"
-        echo "10. Show service status"
-        echo "11. Start service"
-        echo "12. Stop service"
-        echo "13. Show logs"
-        echo "14. Uninstall AnyTLS"
-        echo "0. Back"
+        echo "-- 模式一：自签证书（不需要域名）--"
+        echo "1. 安装 / 重装（使用自签证书）"
+        echo "-- 模式二：你自己域名的真实证书 --"
+        echo "2. HTTP-01 申请证书（需要 80 端口 + 域名解析到本机）"
+        echo "3. Cloudflare DNS-01 申请证书（不需要 80 端口）"
+        echo "4. 使用本机已申请过的证书"
+        echo "5. 立即续期证书"
+        echo "-- 日常管理 --"
+        echo "6. 升级 sing-box（保留端口、密码、证书）"
+        echo "7. 查看客户端配置（分享链接）"
+        echo "8. 修改端口"
+        echo "9. 修改密码"
+        echo "10. 查看服务状态"
+        echo "11. 启动服务"
+        echo "12. 停止服务"
+        echo "13. 查看日志"
+        echo "14. 卸载 AnyTLS"
+        echo "0. 返回上级"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-14]: " choice
+        read -rp "请选择 [0-14]: " choice
         case "${choice}" in
             1) anytls_install_self_signed || true ;;
             2) anytls_install_with_acme_cert || true ;;
@@ -2887,10 +2892,10 @@ anytls_menu() {
             13) anytls_logs ;;
             14) anytls_uninstall ;;
             0) return 0 ;;
-            *) err "Invalid option." ;;
+            *) err "无效选项。" ;;
         esac
         echo
-        read -rp "Press Enter to return to the AnyTLS menu..." _
+        read -rp "按回车返回 AnyTLS 菜单..." _
     done
 }
 
@@ -2907,18 +2912,18 @@ vless_prompt_port() {
     local input
 
     while true; do
-        echo "Press Enter for a random available port, or enter a custom port [1-65535]." >&2
-        read -rp "VLESS+Reality listen port: " input
+        echo "回车使用随机可用端口，或自定义端口 [1-65535]。" >&2
+        read -rp "VLESS+Reality 监听端口: " input
         if [ -z "${input:-}" ]; then
             input="$(random_available_port)"
-            echo "Using random port: ${input}" >&2
+            echo "已随机选择端口：${input}" >&2
         fi
         if ! valid_port "${input}"; then
-            err "Invalid port: ${input}"
+            err "无效端口：${input}"
             continue
         fi
         if is_port_used "${input}"; then
-            err "Port ${input} is already in use."
+            err "端口 ${input} 已被占用。"
             continue
         fi
         printf '%s' "${input}"
@@ -2985,35 +2990,36 @@ EOF
     while true; do
         {
             echo
-            info "Reality masquerade site (TLS handshake target)"
-            echo "This is a well-known third-party HTTPS site that Reality impersonates."
-            echo "It is NOT your domain, needs no DNS record pointing here, and needs no certificate."
-            echo "Pick one that is reachable and not blocked from your server's region."
+            info "Reality 伪装站点（TLS 握手目标）"
+            echo "这是 Reality 用来伪装的第三方知名 HTTPS 网站。"
+            echo "它不是你的域名，不需要解析到本机，也不需要证书。"
+            echo "请选一个你服务器能正常访问、且未被屏蔽的站点。"
             echo
             for i in "${!list[@]}"; do
                 if [ "${list[$i]}" = "${VLESS_DEFAULT_SNI}" ]; then
-                    echo "$((i + 1)). ${list[$i]} (default)"
+                    echo "$((i + 1)). ${list[$i]}（默认）"
                 else
                     echo "$((i + 1)). ${list[$i]}"
                 fi
             done
-            echo "$(( ${#list[@]} + 1 )). Enter another third-party site manually"
-            [ -n "${current}" ] && echo "Current value: ${current}"
+            echo "$(( ${#list[@]} + 1 )). 手动输入其它第三方站点"
+            echo "$(( ${#list[@]} + 2 )). 自动挑选一个本机实测可用的站点（推荐，回车同此项）"
+            [ -n "${current}" ] && echo "当前值：${current}"
         } >&2
 
-        read -rp "Select [1-$(( ${#list[@]} + 2 )), Enter = auto-select]: " choice
+        read -rp "请选择 [1-$(( ${#list[@]} + 2 ))，回车 = 自动挑选]: " choice
 
         # Auto-select probes the candidates and keeps the first one that this
         # server can genuinely complete a TLS 1.3 + X25519 handshake with.
         if [ -z "${choice}" ] || [ "${choice}" = "$(( ${#list[@]} + 2 ))" ]; then
-            info "Testing candidates for TLS 1.3 + X25519 from this server..." >&2
+            info "正在测试候选站点是否支持 TLS 1.3 + X25519..." >&2
             if domain="$(reality_pick_working_target)"; then
-                ok "Selected ${domain} (verified suitable)." >&2
+                ok "已选择 ${domain}（实测可用）。" >&2
                 printf '%s' "${domain}"
                 return 0
             fi
-            warn "No candidate passed the check from this server." >&2
-            warn "Falling back to ${VLESS_DEFAULT_SNI}; verify it afterwards." >&2
+            warn "没有候选站点通过检测。" >&2
+            warn "暂用 ${VLESS_DEFAULT_SNI}，安装后请再验证。" >&2
             printf '%s' "${VLESS_DEFAULT_SNI}"
             return 0
         fi
@@ -3021,34 +3027,34 @@ EOF
         if [[ "${choice}" =~ ^[0-9]+$ ]] && [ "${choice}" -ge 1 ] && [ "${choice}" -le "${#list[@]}" ]; then
             domain="${list[$((choice - 1))]}"
         elif [ "${choice}" = "$(( ${#list[@]} + 1 ))" ]; then
-            read -rp "Third-party site hostname (e.g. www.example.com): " domain
+            read -rp "第三方站点域名（例如 www.example.com）: " domain
             if ! is_valid_domain "${domain}"; then
-                err "Not a valid hostname: ${domain}"
+                err "不是合法的域名：${domain}"
                 continue
             fi
         else
-            err "Please choose a listed option."
+            err "请从列表中选择。"
             continue
         fi
 
         # Verify before accepting: an unsuitable target makes every Reality
         # handshake fail while all the other checks still look fine.
-        info "Checking ${domain} for TLS 1.3 + X25519..." >&2
+        info "正在检测 ${domain} 是否支持 TLS 1.3 + X25519..." >&2
         reality_target_is_suitable "${domain}"
         case "$?" in
             0)
-                ok "${domain} is suitable." >&2
+                ok "${domain} 可用。" >&2
                 printf '%s' "${domain}"
                 return 0
                 ;;
             2)
-                warn "Could not test ${domain} (openssl/timeout missing); accepting it." >&2
+                warn "无法检测 ${domain}（缺少 openssl/timeout），已接受。" >&2
                 printf '%s' "${domain}"
                 return 0
                 ;;
             *)
-                err "${domain} does NOT offer TLS 1.3 with X25519 from this server." >&2
-                err "Reality cannot work with it. Choose another target." >&2
+                err "${domain} 不支持 TLS 1.3 + X25519。" >&2
+                err "Reality 无法使用该站点，请换一个。" >&2
                 continue
                 ;;
         esac
@@ -3263,7 +3269,7 @@ vless_migrate_legacy_params() {
     [ -n "${pub}" ] || return 0
 
     vless_save_public_key "${pub}"
-    ok "Recovered the Reality public key from ${VLESS_PARAMS_FILE} into ${VLESS_PUBKEY_FILE}"
+    ok "已从 ${VLESS_PARAMS_FILE} 恢复 Reality 公钥到 ${VLESS_PUBKEY_FILE}"
     return 0
 }
 
@@ -3377,17 +3383,17 @@ vless_client_export() {
     local port uuid sni pub sid host alias_enc link link_enc
 
     if [ ! -s "${VLESS_CONFIG}" ]; then
-        err "VLESS+Reality config not found: ${VLESS_CONFIG}"
+        err "未找到 VLESS+Reality 配置：${VLESS_CONFIG}"
         return 1
     fi
 
-    port="$(vless_cfg_port)" || { err "Could not read listen_port from ${VLESS_CONFIG}"; return 1; }
-    uuid="$(vless_cfg_uuid)" || { err "Could not read uuid from ${VLESS_CONFIG}"; return 1; }
-    sni="$(vless_cfg_sni)"   || { err "Could not read server_name from ${VLESS_CONFIG}"; return 1; }
-    sid="$(vless_cfg_sid)"   || { err "Could not read short_id from ${VLESS_CONFIG}"; return 1; }
+    port="$(vless_cfg_port)" || { err "无法从 ${VLESS_CONFIG} 读取 listen_port"; return 1; }
+    uuid="$(vless_cfg_uuid)" || { err "无法从 ${VLESS_CONFIG} 读取 uuid"; return 1; }
+    sni="$(vless_cfg_sni)"   || { err "无法从 ${VLESS_CONFIG} 读取 server_name"; return 1; }
+    sid="$(vless_cfg_sid)"   || { err "无法从 ${VLESS_CONFIG} 读取 short_id"; return 1; }
     if ! pub="$(vless_cfg_pubkey)"; then
-        err "Reality public key file is missing: ${VLESS_PUBKEY_FILE}"
-        err "The public key cannot be recovered from the config. Regenerate keys from the VLESS menu."
+        err "Reality 公钥文件缺失：${VLESS_PUBKEY_FILE}"
+        err "公钥无法从配置反推，请在 VLESS 菜单重新生成密钥对。"
         return 1
     fi
 
@@ -3398,8 +3404,8 @@ vless_client_export() {
 
     mkdir -p "${VLESS_DIR}"
     cat > "${VLESS_CLIENT_FILE}" <<EOF
-VLESS + Reality client parameters
-(read back from ${VLESS_CONFIG})
+VLESS + Reality 客户端参数
+（读取自 ${VLESS_CONFIG}）
 Address: ${host}
 Port: ${port}
 UUID: ${uuid}
@@ -3417,7 +3423,7 @@ EOF
     chmod 600 "${VLESS_CLIENT_FILE}"
 
     echo
-    ok "VLESS + Reality client parameters"
+    ok "VLESS + Reality 客户端参数"
     cat "${VLESS_CLIENT_FILE}"
     return 0
 }
@@ -3444,10 +3450,10 @@ vless_verify_client_match() {
     grep -q "type=tcp" "${VLESS_CLIENT_FILE}" || mismatch=1
 
     if [ "${mismatch}" -ne 0 ]; then
-        warn "Client link does not match the server config; regenerate it from the VLESS menu."
+        warn "分享链接与服务端配置不一致，请在 VLESS 菜单重新生成。"
         return 1
     fi
-    ok "Client link matches the server config (uuid, port, sni, pbk, sid, flow, security, type)."
+    ok "分享链接与服务端配置一致（uuid、端口、sni、pbk、sid、flow、security、type）。"
     return 0
 }
 
@@ -3463,23 +3469,23 @@ vless_apply() {
     sing_box_check_config "${VLESS_SING_BOX_BIN}" "${VLESS_CONFIG}" "VLESS+Reality" || return 1
     activate_and_verify "${VLESS_SERVICE_NAME}" "${port}" "VLESS+Reality" || return 1
 
-    ok "VLESS+Reality is running on port ${port}."
+    ok "VLESS+Reality 已在端口 ${port} 上运行。"
 
     # An open port only proves something is bound. Push real traffic through
     # the tunnel with the same credentials clients are given, so a Reality
     # handshake that silently rejects everyone cannot be reported as success.
     echo
-    info "Verifying the data path end to end..."
+    info "正在做端到端连通性验证..."
     if vless_self_test true; then
-        ok "End-to-end verification passed."
+        ok "端到端验证通过。"
     else
         echo
         warn "=============================================================="
-        warn "INSTALL COMPLETED, BUT THE DATA PATH DID NOT VERIFY."
-        warn "The service is running and the port is open, but traffic could"
-        warn "not actually pass through Reality using the published"
-        warn "credentials. Clients will most likely fail too."
-        warn "Run 'Diagnose connectivity' from the VLESS menu next."
+        warn "安装已完成，但端到端验证未通过。"
+        warn "服务在运行、端口也开着，但用发给客户端的凭据"
+        warn "实际无法通过 Reality 传输流量，客户端很可能"
+        warn "同样连不上。"
+        warn "请接着运行 VLESS 菜单里的「连接诊断」。"
         warn "=============================================================="
     fi
 
@@ -3497,17 +3503,17 @@ vless_install() {
     state="$(vless_state)"
     if [ "${state}" != "not_installed" ]; then
         echo
-        warn "VLESS+Reality is already present (state: ${state})."
-        echo "1. Keep the existing UUID, port, keys and SNI; only reinstall the binary and service"
-        echo "2. Back up the current config, then generate a completely new one"
-        echo "3. Show the current client config"
-        echo "0. Cancel"
-        read -rp "Select [0-3]: " choice
+        warn "VLESS+Reality 已安装（状态：${state}）。"
+        echo "1. 保留现有 UUID、端口、密钥和 SNI，仅重装程序和服务"
+        echo "2. 备份当前配置，然后全新生成"
+        echo "3. 查看当前客户端配置"
+        echo "0. 取消"
+        read -rp "请选择 [0-3]: " choice
         case "${choice}" in
             1) vless_repair; return $? ;;
             2) vless_backup_existing ;;
             3) vless_client_export; return $? ;;
-            *) info "Cancelled."; return 0 ;;
+            *) info "已取消。"; return 0 ;;
         esac
     fi
 
@@ -3565,7 +3571,7 @@ vless_update() {
         return 1
     fi
 
-    info "Updating sing-box while keeping the existing UUID, port, keys and SNI."
+    info "正在升级 sing-box，UUID、端口、密钥、SNI 保持不变。"
     vless_repair
 }
 
@@ -3599,7 +3605,7 @@ vless_change_value() {
             ;;
         uuid)
             uuid="$(vless_gen_uuid)" || return 1
-            info "New UUID: ${uuid}"
+            info "新的 UUID：${uuid}"
             ;;
         sni)
             sni="$(vless_prompt_sni "${sni}")"
@@ -3610,7 +3616,7 @@ vless_change_value() {
             priv="${keys%%|*}"
             pub="${keys#*|}"
             sid="$(vless_gen_short_id)" || return 1
-            warn "Reality keys changed: every client must be reconfigured with the new pbk/sid."
+            warn "Reality 密钥已更换，所有客户端都必须更新 pbk/sid。"
             ;;
         *)
             fail_step "VLESS+Reality change" "Unknown field: ${field}"
@@ -3627,51 +3633,51 @@ vless_uninstall() {
 
     require_root
     if ! vless_is_installed; then
-        warn "VLESS+Reality is not installed."
+        warn "VLESS+Reality 尚未安装。"
         return 0
     fi
 
-    warn "This removes only files created by this module:"
+    warn "只会删除本模块自己创建的文件："
     echo "  ${VLESS_DIR}"
     echo "  ${VLESS_SERVICE_FILE}"
-    read -rp "Uninstall VLESS+Reality? [y/N]: " confirm
+    read -rp "确认卸载 VLESS+Reality？[y/N]: " confirm
     [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
 
     systemctl disable --now "${VLESS_SERVICE_NAME}" 2>/dev/null || true
     rm -f "${VLESS_SERVICE_FILE}"
     rm -rf "${VLESS_DIR}"
     systemctl daemon-reload 2>/dev/null || true
-    ok "VLESS+Reality uninstalled. Snell and AnyTLS were not touched."
+    ok "VLESS+Reality 已卸载，Snell 和 AnyTLS 未受影响。"
 }
 
 vless_status() {
     local port
 
     if ! vless_is_installed; then
-        warn "VLESS+Reality is not installed."
+        warn "VLESS+Reality 尚未安装。"
         return 0
     fi
 
     echo
     ok "VLESS+Reality"
-    echo "State: $(vless_state)"
-    echo "sing-box version: $(vless_installed_version)"
-    echo "Port: $(vless_cfg_port 2>/dev/null || echo unknown)"
-    echo "Masquerade SNI: $(vless_cfg_sni 2>/dev/null || echo unknown)"
+    echo "状态：$(vless_state)"
+    echo "sing-box 版本：$(vless_installed_version)"
+    echo "端口：$(vless_cfg_port 2>/dev/null || echo 未知)"
+    echo "伪装 SNI：$(vless_cfg_sni 2>/dev/null || echo 未知)"
 
     if vless_is_active; then
-        echo "Service: running"
+        echo "服务：运行中"
     else
-        echo "Service: stopped"
+        echo "服务：已停止"
     fi
 
     port="$(vless_cfg_port 2>/dev/null || true)"
     if [ -n "${port}" ]; then
         port_is_listening "${port}" 1
         case "$?" in
-            0) echo "Listener: port ${port} is listening" ;;
-            2) warn "Listener: cannot verify (install iproute2 for 'ss')" ;;
-            *) warn "Listener: nothing is listening on port ${port}" ;;
+            0) echo "端口监听：${port} 正在监听" ;;
+            2) warn "端口监听：无法验证（安装 iproute2 可启用 ss 检测）" ;;
+            *) warn "端口监听：端口 ${port} 上没有任何监听" ;;
         esac
     fi
 
@@ -3680,14 +3686,14 @@ vless_status() {
 
 vless_start() {
     require_root
-    vless_is_installed || { warn "VLESS+Reality is not installed."; return 0; }
+    vless_is_installed || { warn "VLESS+Reality 尚未安装。"; return 0; }
     systemctl start "${VLESS_SERVICE_NAME}"
     vless_status
 }
 
 vless_stop() {
     require_root
-    vless_is_installed || { warn "VLESS+Reality is not installed."; return 0; }
+    vless_is_installed || { warn "VLESS+Reality 尚未安装。"; return 0; }
     systemctl stop "${VLESS_SERVICE_NAME}"
     vless_status
 }
@@ -3705,33 +3711,33 @@ report_firewall_for_port() {
     if has_command ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
         seen=1
         if ufw status 2>/dev/null | grep -qE "(^|[[:space:]])${port}(/|[[:space:]]|$)"; then
-            ok "ufw is active and has a rule mentioning port ${port}."
+            ok "ufw 已启用，且存在涉及端口 ${port} 的规则。"
         else
-            warn "ufw is ACTIVE and no rule mentions port ${port}."
-            warn "  Allow it with: ufw allow ${port}/tcp"
+            warn "ufw 已启用，但没有涉及端口 ${port} 的规则。"
+            warn "  放行命令：ufw allow ${port}/tcp"
         fi
     fi
 
     if has_command firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
         seen=1
         if firewall-cmd --list-ports 2>/dev/null | grep -qE "(^|[[:space:]])${port}/tcp"; then
-            ok "firewalld is running and port ${port}/tcp is open."
+            ok "firewalld 正在运行，端口 ${port}/tcp 已开放。"
         else
-            warn "firewalld is RUNNING and port ${port}/tcp is not in the open list."
-            warn "  Allow it with: firewall-cmd --add-port=${port}/tcp --permanent && firewall-cmd --reload"
+            warn "firewalld 正在运行，但端口 ${port}/tcp 不在开放列表中。"
+            warn "  放行命令：firewall-cmd --add-port=${port}/tcp --permanent && firewall-cmd --reload"
         fi
     fi
 
     if [ "${seen}" -eq 0 ]; then
         if has_command iptables && iptables -S 2>/dev/null | grep -qE '^-P INPUT DROP'; then
-            warn "iptables INPUT policy is DROP; make sure port ${port}/tcp is explicitly allowed."
+            warn "iptables INPUT 默认策略为 DROP，请确认已显式放行 ${port}/tcp。"
         else
-            info "No active ufw/firewalld detected on this host."
+            info "本机未检测到启用的 ufw/firewalld。"
         fi
     fi
 
-    warn "A cloud provider security group can still block the port even when the"
-    warn "host firewall allows it. Check your VPS control panel for port ${port}/tcp."
+    warn "即使主机防火墙放行，云服务商的安全组仍可能拦截该端口。"
+    warn "请到 VPS 控制台检查 ${port}/tcp 是否放行。"
 }
 
 # Uses this server's own sing-box as a Reality CLIENT against the running
@@ -3799,11 +3805,11 @@ vless_self_test() {
 EOF
 
     echo
-    info "=== VLESS+Reality self-test ==="
-    echo "Connecting to this server's own inbound using the published credentials."
+    info "=== VLESS+Reality 服务器自测 ==="
+    echo "用发给客户端的同一套凭据，从本机连接本机的入站。"
 
     if ! "${VLESS_SING_BOX_BIN}" check -c "${tmpd}/client.json" >/dev/null 2>&1; then
-        err "The generated test client config was rejected by sing-box:"
+        err "生成的测试客户端配置被 sing-box 拒绝："
         "${VLESS_SING_BOX_BIN}" check -c "${tmpd}/client.json" 2>&1 | sed 's/^/  /' >&2 || true
         rm -rf "${tmpd}"
         return 1
@@ -3814,7 +3820,7 @@ EOF
     sleep 3
 
     if ! kill -0 "${pid}" 2>/dev/null; then
-        err "The test client exited immediately:"
+        err "测试客户端立即退出："
         sed 's/^/  /' "${tmpd}/client.log" >&2 || true
         rm -rf "${tmpd}"
         return 1
@@ -3828,28 +3834,28 @@ EOF
 
     echo
     if [ "${rc}" -eq 0 ] && printf '%s' "${out}" | grep -q '^ip='; then
-        ok "SELF-TEST PASSED: real traffic flowed through Reality."
-        echo "   Exit IP seen by the destination:"
+        ok "自测通过：流量已成功通过 Reality 传输。"
+        echo "   目标网站看到的出口 IP："
         printf '%s\n' "${out}" | grep -E '^(ip|loc)=' | sed 's/^/     /'
         if [ "${quiet}" != "true" ]; then
             echo
-            ok "The server, its credentials and the Reality handshake all work."
-            warn "Therefore the fault is in the client application's configuration."
-            warn "Re-import the share link from menu option 3 into a client that"
-            warn "supports Reality + xtls-rprx-vision, and delete the old entry first."
+            ok "服务端、凭据、Reality 握手全部正常。"
+            warn "因此问题出在客户端配置上。"
+            warn "请用菜单选项 3 的分享链接，重新导入到支持"
+            warn "Reality + xtls-rprx-vision 的客户端，并先删除旧节点。"
         fi
         rm -rf "${tmpd}"
         return 0
     fi
 
-    err "SELF-TEST FAILED: could not pass traffic through Reality."
+    err "自测失败：流量无法通过 Reality 传输。"
     [ -n "${out}" ] && printf '   curl: %s\n' "${out}" >&2
     if [ -s "${tmpd}/client.log" ]; then
-        err "   Test client log:"
+        err "   测试客户端日志："
         sed 's/^/     /' "${tmpd}/client.log" >&2
     fi
-    warn "   Both ends were generated here, so this points at the server side."
-    warn "   Run 'Diagnose connectivity' for a step-by-step breakdown."
+    warn "   两端都是本脚本生成的，因此问题在服务端。"
+    warn "   请运行「连接诊断」查看逐项排查结果。"
     rm -rf "${tmpd}"
     return 1
 }
@@ -3862,30 +3868,30 @@ vless_watch_live() {
 
     require_root
     if ! vless_is_installed; then
-        warn "VLESS+Reality is not installed."
+        warn "VLESS+Reality 尚未安装。"
         return 0
     fi
 
     echo
-    info "Watching ${VLESS_SERVICE_NAME} for ${seconds} seconds."
-    warn "NOW: open your client and try to connect."
+    info "正在监听 ${VLESS_SERVICE_NAME} 日志，共 ${seconds} 秒。"
+    warn "请立刻打开客户端尝试连接。"
     echo
-    echo "How to read what appears:"
-    echo "  'REALITY: processed invalid connection'"
-    echo "      -> the client reached the server but failed Reality auth."
-    echo "         pbk, sid or sni does not match. Re-import the share link."
-    echo "  nothing at all"
-    echo "      -> the client never reached this server. Suspect the cloud"
-    echo "         security group, or the client using a different address/port."
-    echo "  'inbound connection' with no error"
-    echo "      -> authentication succeeded; any remaining problem is routing."
+    echo "如何看结果："
+    echo "  出现 'REALITY: processed invalid connection'"
+    echo "      → 客户端连到了服务器，但 Reality 认证失败。"
+    echo "         pbk / sid / sni 对不上，请重新导入分享链接。"
+    echo "  完全没有输出"
+    echo "      → 流量根本没到本机。请检查云服务商安全组，"
+    echo "         或客户端连的地址/端口不对。"
+    echo "  出现 'inbound connection' 且无报错"
+    echo "      → 认证已成功，问题在认证之后的路由。"
     echo
-    info "--- live log (stops automatically) ---"
+    info "--- 实时日志（到时自动停止）---"
 
     timeout "${seconds}" journalctl -u "${VLESS_SERVICE_NAME}" -f --since now --no-pager 2>/dev/null || true
 
     echo
-    info "--- watch finished ---"
+    info "--- 观察结束 ---"
     return 0
 }
 
@@ -3911,13 +3917,13 @@ vless_diagnose() {
     pub="$(vless_cfg_pubkey 2>/dev/null || true)"
 
     echo
-    info "=== VLESS+Reality diagnosis ==="
+    info "=== VLESS+Reality 连接诊断 ==="
 
     # 1. Service
     if service_is_active "${VLESS_SERVICE_NAME}"; then
-        ok "1. Service ${VLESS_SERVICE_NAME} is active."
+        ok "1. 服务 ${VLESS_SERVICE_NAME} 正在运行。"
     else
-        err "1. Service ${VLESS_SERVICE_NAME} is NOT active."
+        err "1. 服务 ${VLESS_SERVICE_NAME} 未运行。"
         problems=$((problems + 1))
         journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 20 >&2 || true
     fi
@@ -3926,22 +3932,22 @@ vless_diagnose() {
     #     the old keys, so the file validates while every client is rejected.
     local running_cfg
     if service_config_is_stale "${VLESS_SERVICE_NAME}" "${VLESS_CONFIG}"; then
-        err "1b. The RUNNING service is older than ${VLESS_CONFIG}."
-        err "    It is still serving the previous keys, so the current share link"
-        err "    cannot authenticate. This alone explains 'invalid connection'."
-        warn "    Fix it now with:  systemctl restart ${VLESS_SERVICE_NAME}"
-        warn "    (or use 'Repair install' from the VLESS menu)"
+        err "1b. 运行中的服务比 ${VLESS_CONFIG} 旧。"
+        err "    它仍在用旧密钥，因此当前分享链接无法通过认证，"
+        err "    这本身就足以导致 invalid connection。"
+        warn "    立即修复：systemctl restart ${VLESS_SERVICE_NAME}"
+        warn "    （或使用 VLESS 菜单里的「修复安装」）"
         problems=$((problems + 1))
     else
         case "$?" in
-            1) ok "1b. The running service matches the current config file." ;;
-            *) warn "1b. Could not determine whether the running service is current." ;;
+            1) ok "1b. 运行中的服务与当前配置文件一致。" ;;
+            *) warn "1b. 无法判断运行中的服务是否为最新配置。" ;;
         esac
     fi
 
     running_cfg="$(service_running_config_path "${VLESS_SERVICE_NAME}" 2>/dev/null || true)"
     if [ -n "${running_cfg}" ] && [ "${running_cfg}" != "${VLESS_CONFIG}" ]; then
-        err "    The live process was started with a different config file:"
+        err "    运行中的进程加载的是另一个配置文件："
         err "      running: ${running_cfg}"
         err "      managed: ${VLESS_CONFIG}"
         problems=$((problems + 1))
@@ -3950,14 +3956,14 @@ vless_diagnose() {
     # 2. Config accepted by this sing-box build
     if [ -x "${VLESS_SING_BOX_BIN}" ]; then
         if "${VLESS_SING_BOX_BIN}" check -c "${VLESS_CONFIG}" >/dev/null 2>&1; then
-            ok "2. sing-box accepts the config."
+            ok "2. sing-box 接受该配置。"
         else
-            err "2. sing-box REJECTS the config:"
+            err "2. sing-box 拒绝该配置："
             "${VLESS_SING_BOX_BIN}" check -c "${VLESS_CONFIG}" 2>&1 | sed 's/^/     /' >&2 || true
             problems=$((problems + 1))
         fi
     else
-        err "2. sing-box binary missing at ${VLESS_SING_BOX_BIN}"
+        err "2. sing-box 程序缺失：${VLESS_SING_BOX_BIN}"
         problems=$((problems + 1))
     fi
 
@@ -3965,39 +3971,39 @@ vless_diagnose() {
     port_is_listening "${port}" 1
     case "$?" in
         0)
-            ok "3. Port ${port} is listening locally."
+            ok "3. 端口 ${port} 正在本机监听。"
             if has_command ss; then
                 ss -tlnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print "     " $0}' >&2 || true
             fi
             ;;
         2)
-            warn "3. Cannot verify the listener: no ss/netstat/lsof on this host."
-            warn "   Install iproute2 to enable this check."
+            warn "3. 无法验证端口监听：本机没有 ss/netstat/lsof。"
+            warn "   安装 iproute2 可启用该检查。"
             ;;
         *)
-            err "3. Nothing is listening on port ${port}."
+            err "3. 端口 ${port} 上没有任何监听。"
             problems=$((problems + 1))
             ;;
     esac
 
     # 4. Firewall / security group
     echo
-    info "4. Firewall check for port ${port}"
+    info "4. 端口 ${port} 的防火墙检查"
     report_firewall_for_port "${port}"
 
     # 5. Reality handshake target reachability -- the check that matters most
     #    here, and the one AnyTLS never needs.
     echo
-    info "5. Reality handshake target: ${sni}"
+    info "5. Reality 伪装目标：${sni}"
     if has_command timeout && has_command openssl; then
         tls_out="$(timeout 10 openssl s_client -connect "${sni}:443" -servername "${sni}" </dev/null 2>&1 || true)"
         if printf '%s' "${tls_out}" | grep -q "CONNECTED"; then
-            ok "   This server can reach ${sni}:443"
+            ok "   本机可以访问 ${sni}:443"
             if printf '%s' "${tls_out}" | grep -qE "Protocol *: *TLSv1\.3|TLSv1\.3"; then
-                ok "   ${sni} negotiates TLS 1.3."
+                ok "   ${sni} 支持 TLS 1.3。"
             else
-                err "   ${sni} did NOT negotiate TLS 1.3. Reality requires a TLS 1.3 target."
-                warn "   Change it from the VLESS menu: 'Change masquerade SNI'."
+                err "   ${sni} 不支持 TLS 1.3，Reality 要求目标支持 TLS 1.3。"
+                warn "   请在 VLESS 菜单里用「修改伪装域名 SNI」更换。"
                 problems=$((problems + 1))
             fi
 
@@ -4005,38 +4011,38 @@ vless_diagnose() {
             # every other check and still break every Reality handshake here.
             reality_target_is_suitable "${sni}"
             case "$?" in
-                0) ok "   ${sni} supports X25519 key exchange (required by Reality)." ;;
-                2) warn "   Could not test X25519 support for ${sni}." ;;
+                0) ok "   ${sni} 支持 X25519 密钥交换（Reality 必需）。" ;;
+                2) warn "   无法检测 ${sni} 的 X25519 支持情况。" ;;
                 *)
-                    err "   ${sni} does NOT offer TLS 1.3 with X25519 key exchange."
-                    err "   Reality REQUIRES this. Every handshake will fail, which is"
-                    err "   exactly the 'processed invalid connection' you are seeing."
-                    warn "   Fix: VLESS menu -> 'Change masquerade SNI' -> press Enter"
-                    warn "   to auto-select a target verified to work from this server."
+                    err "   ${sni} 不支持 TLS 1.3 + X25519 密钥交换。"
+                    err "   Reality 强制要求这一点，否则每次握手都会失败，"
+                    err "   这正是你看到的 processed invalid connection。"
+                    warn "   修复：VLESS 菜单 →「修改伪装域名 SNI」→ 直接回车"
+                    warn "   自动挑选一个本机实测可用的站点。"
                     problems=$((problems + 1))
                     ;;
             esac
         else
-            err "   This server CANNOT reach ${sni}:443"
-            err "   Reality relays the TLS handshake to this site, so it cannot work."
-            warn "   Pick a target your server can actually reach, from the VLESS menu:"
-            warn "   'Change masquerade SNI (handshake target)'."
+            err "   本机无法访问 ${sni}:443"
+            err "   Reality 需要把 TLS 握手转发给该站点，因此无法工作。"
+            warn "   请在 VLESS 菜单里改成本机能访问的站点："
+            warn "   「修改伪装域名 SNI（握手目标站点）」。"
             problems=$((problems + 1))
         fi
     else
-        warn "   Skipped: openssl or timeout is unavailable."
+        warn "   已跳过：缺少 openssl 或 timeout。"
     fi
 
     # 6. Clock: Reality rejects handshakes outside a tolerance window.
     echo
-    info "6. System clock"
+    info "6. 系统时钟"
     echo "   UTC now: $(date -u)"
     if has_command timedatectl; then
         if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then
-            ok "   Clock is NTP-synchronised."
+            ok "   时钟已与 NTP 同步。"
         else
-            warn "   Clock is NOT NTP-synchronised. Reality is time-sensitive."
-            warn "   Fix with: timedatectl set-ntp true"
+            warn "   时钟未与 NTP 同步，Reality 对时间敏感。"
+            warn "   修复：timedatectl set-ntp true"
         fi
     fi
 
@@ -4044,54 +4050,54 @@ vless_diagnose() {
     #     log means the client failed Reality authentication, so verify the
     #     advertised public key really derives from the server's private key.
     echo
-    info "6b. Reality credentials"
+    info "6b. Reality 凭据"
     local priv derived
     priv="$(vless_cfg_priv 2>/dev/null || true)"
 
     if [ "${#pub}" -eq 43 ] && [[ "${pub}" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
-        ok "   Public key format looks correct (43 base64url chars)."
+        ok "   公钥格式正确（43 位 base64url）。"
     else
-        err "   Public key looks malformed: '${pub}' (${#pub} chars, expected 43)."
+        err "   公钥格式异常：${pub}（${#pub} 位，应为 43 位）。"
         problems=$((problems + 1))
     fi
 
     if [[ "${sid}" =~ ^([0-9a-f]{2}){1,8}$ ]]; then
-        ok "   Short ID format looks correct (${sid})."
+        ok "   Short ID 格式正确（${sid}）。"
     else
-        err "   Short ID looks malformed: '${sid}' (expected 2-16 hex chars)."
+        err "   Short ID 格式异常：${sid}（应为 2-16 位十六进制）。"
         problems=$((problems + 1))
     fi
 
     if [ -n "${priv}" ] && derived="$(vless_derive_reality_public_key "${priv}")"; then
         if [ "${derived}" = "${pub}" ]; then
-            ok "   Public key matches the server's private key."
+            ok "   公钥与服务器私钥匹配。"
         else
-            err "   MISMATCH: the stored public key does not belong to the private key."
-            err "     stored : ${pub}"
-            err "     derived: ${derived}"
-            warn "   Clients using the stored key can never authenticate."
-            warn "   Fix by giving clients the derived key above, or regenerate the"
-            warn "   key pair from the VLESS menu ('Regenerate Reality key pair')."
+            err "   不匹配：保存的公钥不属于当前私钥。"
+            err "     已保存：${pub}"
+            err "     实际应为：${derived}"
+            warn "   使用旧公钥的客户端永远无法认证成功。"
+            warn "   请把上面「实际应为」的公钥给客户端，或用 VLESS 菜单"
+            warn "   里的「重新生成 Reality 密钥对」。"
             problems=$((problems + 1))
         fi
     else
-        warn "   Could not derive the public key locally; skipping this check."
+        warn "   无法在本机推导公钥，已跳过该检查。"
     fi
 
     if journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 500 2>/dev/null \
         | grep -q "REALITY: processed invalid connection"; then
         echo
-        warn "   The log shows 'REALITY: processed invalid connection'."
-        warn "   That means clients ARE reaching this server but failing Reality"
-        warn "   authentication. Network, port and firewall are therefore fine."
-        warn "   Re-copy the full share link from menu option 3 rather than typing"
-        warn "   the public key by hand: a single wrong or missing character in"
-        warn "   pbk or sid produces exactly this error."
+        warn "   日志出现 REALITY: processed invalid connection。"
+        warn "   说明客户端已连到本机但 Reality 认证失败，"
+        warn "   因此网络、端口、防火墙都没问题。"
+        warn "   请用菜单选项 3 复制完整分享链接，不要手抄公钥："
+        warn "   pbk 或 sid 少一个字符就会导致完全相同的报错。"
+        warn ""
     fi
 
     # 7. Effective client parameters
     echo
-    info "7. Client must match these exactly"
+    info "7. 客户端必须与以下参数完全一致"
     host="$(client_endpoint_host)"
     echo "   address    : ${host}"
     echo "   port       : ${port}"
@@ -4103,17 +4109,17 @@ vless_diagnose() {
     echo "   publicKey  : ${pub}"
     echo "   shortId    : ${sid}"
     echo "   network    : tcp"
-    warn "   TLS 'allow insecure' must be OFF for Reality."
-    warn "   The client must support Reality + xtls-rprx-vision. If it connects"
-    warn "   but no traffic flows, an unsupported or missing flow is the usual cause."
+    warn "   Reality 必须关闭「跳过证书验证 / allow insecure」。"
+    warn "   客户端必须支持 Reality + xtls-rprx-vision。若能连上"
+    warn "   但没有流量，通常是 flow 不支持或未设置。"
 
     # 8. Errors, with an explicit age so stale entries are not mistaken for a
     #    live failure.
     echo
-    info "8. Service errors"
+    info "8. 服务报错"
     local since_start recent_count old_count
     since_start="$(systemctl show "${VLESS_SERVICE_NAME}" -p ActiveEnterTimestamp --value 2>/dev/null || true)"
-    [ -n "${since_start}" ] && echo "   Service started: ${since_start}"
+    [ -n "${since_start}" ] && echo "   服务启动时间：${since_start}"
 
     recent_count="$(journalctl -u "${VLESS_SERVICE_NAME}" --no-pager --since '-5 min' 2>/dev/null \
         | grep -ciE "error|fatal|reject|refused" || true)"
@@ -4121,24 +4127,24 @@ vless_diagnose() {
         | grep -ciE "error|fatal|reject|refused" || true)"
 
     if [ "${recent_count:-0}" -gt 0 ]; then
-        err "   ${recent_count} error(s) in the LAST 5 MINUTES -- this is happening now:"
+        err "   最近 5 分钟内有 ${recent_count} 条报错 —— 问题正在发生："
         journalctl -u "${VLESS_SERVICE_NAME}" --no-pager --since '-5 min' 2>/dev/null \
             | grep -iE "error|fatal|reject|refused" | tail -n 5 | sed 's/^/     /'
     elif [ "${old_count:-0}" -gt 0 ]; then
-        warn "   No errors in the last 5 minutes, but ${old_count} older one(s) exist."
-        warn "   These may be stale. Use 'Watch live connection attempts' to test now."
+        warn "   最近 5 分钟无报错，但有 ${old_count} 条更早的记录。"
+        warn "   可能是历史残留。请用「实时观察连接」现场测试。"
         journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 500 2>/dev/null \
             | grep -iE "error|fatal|reject|refused" | tail -n 3 | sed 's/^/     /'
     else
-        ok "   No errors found."
+        ok "   未发现报错。"
     fi
 
     echo
     if [ "${problems}" -eq 0 ]; then
-        ok "No server-side fault found. Focus on the client parameters in step 7,"
-        ok "and on any cloud provider security group for port ${port}."
+        ok "未发现服务端问题。请重点核对第 7 项的客户端参数，"
+        ok "以及云服务商安全组是否放行了端口 ${port}。"
     else
-        err "Found ${problems} server-side problem(s). Fix the items marked above."
+        err "发现 ${problems} 处服务端问题，请修复上面标红的项。"
     fi
     return 0
 }
@@ -4149,28 +4155,28 @@ vless_menu() {
     while true; do
         clear
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}        VLESS + Reality Manager${RESET}"
-        echo -e "${CYAN}   No domain, no certificate, no port 80${RESET}"
+        echo -e "${CYAN}        VLESS + Reality 管理${RESET}"
+        echo -e "${CYAN}     无需域名、无需证书、无需 80 端口${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo "1. Install / reinstall VLESS+Reality"
-        echo "2. Update sing-box (keeps UUID, port, keys, SNI)"
-        echo "3. Show client config"
-        echo "4. Change port"
-        echo "5. Change UUID"
-        echo "6. Change masquerade SNI (handshake target)"
-        echo "7. Regenerate Reality key pair + short ID"
-        echo "8. Repair install (rebuild binary/service, keep settings)"
-        echo "9. Show service status"
-        echo "10. Start service"
-        echo "11. Stop service"
-        echo "12. Show logs"
-        echo "13. Diagnose connectivity (why clients cannot connect)"
-        echo "14. Watch live connection attempts (try your client now)"
-        echo "15. Self-test from this server (server fault or client fault?)"
-        echo "16. Uninstall VLESS+Reality"
-        echo "0. Back"
+        echo "1. 安装 / 重装 VLESS+Reality"
+        echo "2. 升级 sing-box（保留 UUID、端口、密钥、SNI）"
+        echo "3. 查看客户端配置（分享链接）"
+        echo "4. 修改端口"
+        echo "5. 修改 UUID"
+        echo "6. 修改伪装域名 SNI（握手目标站点）"
+        echo "7. 重新生成 Reality 密钥对 + short ID"
+        echo "8. 修复安装（重装程序/服务，保留设置）"
+        echo "9. 查看服务状态"
+        echo "10. 启动服务"
+        echo "11. 停止服务"
+        echo "12. 查看日志"
+        echo "13. 连接诊断（客户端连不上时用）"
+        echo "14. 实时观察连接（现在用客户端连一次）"
+        echo "15. 服务器自测（判断是服务端还是客户端的问题）"
+        echo "16. 卸载 VLESS+Reality"
+        echo "0. 返回上级"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-16]: " choice
+        read -rp "请选择 [0-16]: " choice
         case "${choice}" in
             1) vless_install || true ;;
             2) vless_update || true ;;
@@ -4189,10 +4195,10 @@ vless_menu() {
             15) vless_self_test || true ;;
             16) vless_uninstall ;;
             0) return 0 ;;
-            *) err "Invalid option." ;;
+            *) err "无效选项。" ;;
         esac
         echo
-        read -rp "Press Enter to return to the VLESS+Reality menu..." _
+        read -rp "按回车返回 VLESS+Reality 菜单..." _
     done
 }
 
@@ -4213,57 +4219,57 @@ deploy_stack() {
 
     if [ "${with_cert}" = "true" ]; then
         echo
-        info "AnyTLS certificate method for this deployment:"
-        echo "1. Issue a new certificate via HTTP-01 (port 80 must be reachable)"
-        echo "2. Issue a new certificate via Cloudflare DNS-01 (port 80 not required)"
-        echo "3. Use a certificate already issued on this server"
-        read -rp "Select certificate method [1-3]: " method
+        info "本次部署 AnyTLS 使用的证书方式："
+        echo "1. 用 HTTP-01 申请新证书（需要 80 端口可达）"
+        echo "2. 用 Cloudflare DNS-01 申请新证书（不需要 80 端口）"
+        echo "3. 使用本机已申请过的证书"
+        read -rp "请选择证书申请方式 [1-3]: " method
         case "${method}" in
             1|2|3) : ;;
-            *) err "Invalid option."; return 1 ;;
+            *) err "无效选项。"; return 1 ;;
         esac
     fi
 
     if [ "${with_bbr}" = "true" ]; then
         step=$((step + 1))
-        info "Step ${step}/${total}: Enable BBR"
+        info "第 ${step}/${total} 步：开启 BBR"
         enable_bbr || failed+=("BBR")
         echo
     fi
 
     step=$((step + 1))
-    info "Step ${step}/${total}: Snell"
+    info "第 ${step}/${total} 步：安装 Snell"
     install_snell || failed+=("Snell")
     echo
 
     step=$((step + 1))
-    info "Step ${step}/${total}: VLESS+Reality"
-    info "Reality uses a third-party site's TLS handshake; it needs no domain and no certificate."
+    info "第 ${step}/${total} 步：安装 VLESS+Reality"
+    info "Reality 借用第三方站点的 TLS 握手，无需域名和证书。"
     vless_install || failed+=("VLESS+Reality")
     echo
 
     step=$((step + 1))
     if [ "${with_cert}" = "true" ]; then
-        info "Step ${step}/${total}: AnyTLS with your domain certificate"
+        info "第 ${step}/${total} 步：安装 AnyTLS（使用你的域名证书）"
         case "${method}" in
             1) anytls_install_with_acme_cert || failed+=("AnyTLS") ;;
             2) anytls_install_with_cloudflare_cert || failed+=("AnyTLS") ;;
             3) anytls_apply_existing_cert || failed+=("AnyTLS") ;;
         esac
     else
-        info "Step ${step}/${total}: AnyTLS with a self-signed certificate"
+        info "第 ${step}/${total} 步：安装 AnyTLS（自签证书）"
         anytls_install_self_signed || failed+=("AnyTLS")
     fi
 
     echo
     if [ "${#failed[@]}" -eq 0 ]; then
-        ok "All requested components completed successfully."
+        ok "所选组件已全部安装成功。"
         return 0
     fi
 
-    err "Completed with failures in: ${failed[*]}"
-    warn "The other components were still installed. Re-run the individual menu"
-    warn "entry for each failed component to see its error again."
+    err "以下组件失败：${failed[*]}"
+    warn "其余组件已正常安装。可单独进入对应菜单重跑失败项，"
+    warn "以查看具体报错。"
     return 1
 }
 
@@ -4274,24 +4280,24 @@ deploy_bbr_three_with_domain_cert() { deploy_stack "true" "true"; }
 restart_proxy_services() {
     require_root
 
-    info "Restarting Snell, VLESS+Reality, and AnyTLS services only. BBR will not be restarted or changed."
+    info "仅重启 Snell、VLESS+Reality、AnyTLS 三个服务，不会改动 BBR。"
 
     if [ -f "${SERVICE_FILE}" ]; then
         activate_and_verify "snell" "$(snell_main_port)" "Snell" || true
     else
-        warn "Snell service file not found; skipped."
+        warn "未找到 Snell 服务文件，已跳过。"
     fi
 
     if [ -f "${VLESS_SERVICE_FILE}" ]; then
         activate_and_verify "${VLESS_SERVICE_NAME}" "$(vless_cfg_port 2>/dev/null || true)" "VLESS+Reality" || true
     else
-        warn "VLESS+Reality service file not found; skipped."
+        warn "未找到 VLESS+Reality 服务文件，已跳过。"
     fi
 
     if [ -f "${ANYTLS_SERVICE_FILE}" ]; then
         activate_and_verify "${ANYTLS_SERVICE_NAME}" "$(anytls_cfg_port 2>/dev/null || true)" "AnyTLS" || true
     else
-        warn "AnyTLS service file not found; skipped."
+        warn "未找到 AnyTLS 服务文件，已跳过。"
     fi
 
     echo
@@ -4342,18 +4348,18 @@ user_menu() {
 
     while true; do
         echo
-        info "User config management"
-        echo "1. Show configs"
-        echo "2. Add additional user config"
-        echo "3. Remove additional user config"
-        echo "0. Back"
-        read -rp "Select [0-3]: " choice
+        info "多用户配置管理"
+        echo "1. 查看所有配置"
+        echo "2. 新增一个用户配置"
+        echo "3. 删除一个用户配置"
+        echo "0. 返回上级"
+        read -rp "请选择 [0-3]: " choice
         case "${choice}" in
             1) show_config ;;
             2) add_user ;;
             3) remove_user ;;
             0) return 0 ;;
-            *) err "Invalid option." ;;
+            *) err "无效选项。" ;;
         esac
     done
 }
@@ -4361,56 +4367,55 @@ user_menu() {
 security_note() {
     cat <<'EOF'
 
-Security notes:
-- This script does not execute remote scripts from third-party repositories.
-- This script does not auto-update itself.
-- This script does not upload server information, config, ports, or PSKs.
-- Snell binaries are downloaded only from https://dl.nssurge.com/snell/.
-- VLESS+Reality and AnyTLS both run on official sing-box releases from https://github.com/SagerNet/sing-box/releases.
-- Reality never uses your own certificate: it borrows a third-party site's TLS
-  handshake, so VLESS+Reality needs no domain, no ACME and no port 80.
-- All certificate handling belongs to AnyTLS only. Installing Reality never
-  triggers certbot.
-- Cloudflare DNS certificates store the API token at /etc/letsencrypt/cloudflare.ini with chmod 600.
-- BBR is enabled locally through sysctl and modprobe only; no remote BBR script is used.
-- Uninstalling a module removes only that module's own files; /etc/letsencrypt
-  certificates and the other two protocols are left untouched.
-- Old script cleanup removes only legacy menu script files and shortcuts after confirmation.
-- Features from third-party scripts were reimplemented locally instead of being pasted as remote-execution code.
-- Do not publish /etc/snell/users/*.conf because those files contain PSKs.
-- Do not publish /etc/AnyTLS/config.json because it contains the AnyTLS password.
-- Do not publish /etc/vless-reality/config.json because it contains your UUID
-  and the Reality private key.
+安全说明：
+- 本脚本不会执行任何第三方仓库的远程脚本。
+- 本脚本不会自动更新自身。
+- 本脚本不会上传服务器信息、配置、端口或密钥。
+- Snell 程序仅从 https://dl.nssurge.com/snell/ 下载。
+- VLESS+Reality 和 AnyTLS 均使用 sing-box 官方发布版本
+  https://github.com/SagerNet/sing-box/releases 。
+- Reality 从不使用你自己的证书：它借用第三方站点的 TLS 握手，
+  因此无需域名、无需 ACME、无需 80 端口。
+- 所有证书逻辑只属于 AnyTLS，安装 Reality 绝不会触发 certbot。
+- Cloudflare DNS 证书的 API 令牌保存在 /etc/letsencrypt/cloudflare.ini，权限 600。
+- BBR 仅通过本机 sysctl 和 modprobe 开启，不使用任何远程 BBR 脚本。
+- 卸载某个模块只删除该模块自己的文件；/etc/letsencrypt 下的证书
+  和另外两个协议都不会被动。
+- 清理旧文件只会在你确认后删除历史菜单脚本和快捷方式。
+- 参考脚本的功能是本地重新实现的，而不是粘贴远程执行代码。
+- 请勿公开 /etc/snell/users/*.conf，其中含 PSK。
+- 请勿公开 /etc/AnyTLS/config.json，其中含 AnyTLS 密码。
+- 请勿公开 /etc/vless-reality/config.json，其中含 UUID 和 Reality 私钥。
 EOF
 }
 
 show_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}        Snell + VLESS-Reality + AnyTLS Manager v${SCRIPT_VERSION}${RESET}"
+    echo -e "${CYAN}     Snell + VLESS-Reality + AnyTLS 管理脚本 v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}        githubh01/snell${RESET}"
-    echo -e "${CYAN}        Shortcut: hardy${RESET}"
+    echo -e "${CYAN}        快捷命令: hardy${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo "1. Snell management"
-    echo "2. VLESS+Reality management"
-    echo "3. AnyTLS management"
-    echo "4. Enable BBR only"
-    echo "5. Deploy Snell + VLESS-Reality + AnyTLS (no domain certificate, BBR unchanged)"
-    echo "6. Deploy Snell + VLESS-Reality + AnyTLS using your domain certificate (BBR unchanged)"
-    echo "7. Enable BBR, then deploy Snell + VLESS-Reality + AnyTLS using your domain certificate"
-    echo "8. Restart Snell + VLESS-Reality + AnyTLS services"
-    echo "9. AnyTLS only: HTTP-01 certificate (requires port 80)"
-    echo "10. AnyTLS only: Cloudflare DNS certificate (no port 80)"
-    echo "11. Show Snell config"
-    echo "12. Show VLESS+Reality config"
-    echo "13. Show AnyTLS config"
-    echo "14. Show Snell status"
-    echo "15. Show VLESS+Reality status"
-    echo "16. Show AnyTLS status"
-    echo "17. Install / repair hardy shortcut"
-    echo "18. Clean old script files"
-    echo "19. Security notes"
-    echo "0. Exit"
+    echo "1. Snell 管理"
+    echo "2. VLESS+Reality 管理"
+    echo "3. AnyTLS 管理"
+    echo "4. 仅开启 BBR 加速"
+    echo "5. 一键搭建三协议（AnyTLS 用自签证书，不改 BBR）"
+    echo "6. 一键搭建三协议（AnyTLS 绑定你的域名证书，不改 BBR）"
+    echo "7. 先开 BBR，再搭建三协议（AnyTLS 绑定域名证书）"
+    echo "8. 重启三个协议的服务"
+    echo "9. 仅 AnyTLS：HTTP-01 申请证书（需要 80 端口）"
+    echo "10. 仅 AnyTLS：Cloudflare DNS 申请证书（不需要 80 端口）"
+    echo "11. 查看 Snell 配置"
+    echo "12. 查看 VLESS+Reality 配置"
+    echo "13. 查看 AnyTLS 配置"
+    echo "14. 查看 Snell 状态"
+    echo "15. 查看 VLESS+Reality 状态"
+    echo "16. 查看 AnyTLS 状态"
+    echo "17. 安装 / 修复 hardy 快捷命令"
+    echo "18. 清理旧版脚本文件"
+    echo "19. 安全说明"
+    echo "0. 退出"
     echo -e "${CYAN}============================================${RESET}"
 }
 
@@ -4421,7 +4426,7 @@ main() {
 
     while true; do
         show_menu
-        read -rp "Select [0-19]: " choice
+        read -rp "请选择 [0-19]: " choice
         case "${choice}" in
             1) snell_menu ;;
             2) vless_menu ;;
@@ -4443,10 +4448,10 @@ main() {
             18) cleanup_old_script_files ;;
             19) security_note ;;
             0) ok "Bye."; exit 0 ;;
-            *) err "Invalid option." ;;
+            *) err "无效选项。" ;;
         esac
         echo
-        read -rp "Press Enter to return to the menu..." _
+        read -rp "按回车返回主菜单..." _
     done
 }
 

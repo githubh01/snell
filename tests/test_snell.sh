@@ -248,7 +248,10 @@ if grep -q "ExecStart=$SNELL_BIN -c $MAIN_CONF" "$SERVICE_FILE"; then t_ok "snel
 if grep -q "^User=" "$SERVICE_FILE"; then t_ok "snell unit runs as a dedicated user"; else t_bad "snell unit runs as a dedicated user" ""; fi
 
 echo "== 16. Reality/AnyTLS certificate decoupling =="
-if grep -n "certbot\|letsencrypt\|acme" "$SANDBOX/lib.sh" | grep -iE "vless|reality" ; then
+# Inspect executable lines only: the security-notes heredoc is documentation
+# and legitimately mentions both Reality and certbot in one sentence.
+CODE_ONLY="$(awk '/^security_note\(\) \{/{skip=1} skip && /^}/{skip=0; next} !skip' "$SANDBOX/lib.sh" | grep -v '^[[:space:]]*#')"
+if grep -n "certbot\|letsencrypt\|acme" <<<"$CODE_ONLY" | grep -iE "vless|reality" ; then
   t_bad "no ACME references inside the VLESS module" "found above"
 else
   t_ok "no ACME references inside the VLESS module"
