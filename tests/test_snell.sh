@@ -175,10 +175,24 @@ if grep -q "sni=proxy.example.com" <<<"$ALINK"; then t_ok "acme sni is the domai
 if anytls_verify_client_match >/dev/null 2>&1; then t_ok "anytls_verify_client_match agrees"; else t_bad "anytls_verify_client_match agrees" ""; fi
 
 echo "== 9. Snell Surge version mapping (installed version drives output) =="
-check "v4 server -> version 4"     "$(snell_surge_versions v4)"      "4"
-check "v5 server -> versions 4 5"  "$(snell_surge_versions v5)"      "4 5"
-check "v6 server -> version 6"     "$(snell_surge_versions v6)"      "6"
-check "unknown -> version 4"       "$(snell_surge_versions unknown)" "4"
+# v6 is not backward compatible and "reuse" is a v4-era parameter.
+V4L="$(snell_surge_lines v4 1.2.3.4 443 PSK)"
+V5L="$(snell_surge_lines v5 1.2.3.4 443 PSK)"
+V6L="$(snell_surge_lines v6 1.2.3.4 443 PSK)"
+check "v4 emits one line"            "$(printf '%s\n' "$V4L" | grep -c '^Snell = ')" "1"
+check "v4 uses version = 4"          "$(printf '%s' "$V4L" | grep -c 'version = 4')" "1"
+check "v4 keeps reuse"               "$(printf '%s' "$V4L" | grep -c 'reuse = true')" "1"
+check "v5 emits two lines"           "$(printf '%s\n' "$V5L" | grep -c '^Snell = ')" "2"
+check "v5 primary is version = 5"    "$(printf '%s\n' "$V5L" | head -1 | grep -c 'version = 5')" "1"
+check "v5 offers v4 compatibility"   "$(printf '%s\n' "$V5L" | grep -c 'version = 4')" "1"
+check "v5 never emits version = 6"   "$(printf '%s' "$V5L" | grep -c 'version = 6')" "0"
+check "v5 line has no reuse"         "$(printf '%s\n' "$V5L" | head -1 | grep -c 'reuse')" "0"
+check "v6 emits one line"            "$(printf '%s\n' "$V6L" | grep -c '^Snell = ')" "1"
+check "v6 uses version = 6"          "$(printf '%s' "$V6L" | grep -c 'version = 6')" "1"
+check "v6 drops the v4-era reuse"    "$(printf '%s' "$V6L" | grep -c 'reuse')" "0"
+if snell_surge_lines unknown 1.2.3.4 443 PSK >/dev/null 2>&1; then
+  t_bad "unknown version emits nothing" "it produced a node anyway"
+else t_ok "unknown version emits nothing"; fi
 
 echo "== 10. Snell config write + read-back =="
 SERVICE_USER="root"; SERVICE_GROUP="root"
@@ -210,7 +224,7 @@ snell_installed_major() { echo "v5"; }
 detect_public_ip() { printf '203.0.113.10'; }
 OUT="$(print_one_config "$MAIN_CONF" "test" 2>/dev/null)"
 echo "$OUT" | grep '^Snell = ' | sed 's/^/     /'
-check "v5 emits two Surge lines" "$(echo "$OUT" | grep -c '^Snell = ')" "2"
+check "v5 emits two Surge lines" "$(echo "$OUT" | grep -c 'Snell = snell')" "2"
 if echo "$OUT" | grep -q 'version = 4,'; then t_ok "v5 emits version = 4"; else t_bad "v5 emits version = 4" "$OUT"; fi
 if echo "$OUT" | grep -q 'version = 5,'; then t_ok "v5 emits version = 5"; else t_bad "v5 emits version = 5" "$OUT"; fi
 if echo "$OUT" | grep -q 'version = 6'; then t_bad "v5 must NOT emit version = 6" "$OUT"; else t_ok "v5 does not emit version = 6"; fi
