@@ -882,6 +882,7 @@ prompt_port() {
     local default_port="${1:-443}"
     local port
     local prompt
+    local confirm_low
 
     while true; do
         if [ "${default_port}" = "random" ]; then
@@ -899,6 +900,24 @@ prompt_port() {
             err "端口必须是 1-65535 之间的数字。"
             continue
         fi
+
+        # The other two protocols already refuse an occupied port; Snell must
+        # too, otherwise the service starts and then dies on its listener.
+        if [ "${port}" != "${default_port}" ] && is_port_used "${port}"; then
+            err "端口 ${port} 已被占用，请换一个。"
+            continue
+        fi
+
+        # Ports below 1024 are reserved for system services (SSH, DNS, mail…)
+        # and are commonly filtered by ISPs, which looks exactly like "the
+        # proxy stopped working".
+        if [ "${port}" -lt 1024 ]; then
+            warn "端口 ${port} 属于系统保留端口（<1024）。"
+            warn "这类端口容易与系统服务冲突，且常被运营商屏蔽，不建议使用。"
+            read -rp "确定要使用端口 ${port} 吗？[y/N]: " confirm_low
+            [[ "${confirm_low}" =~ ^[Yy]$ ]] || continue
+        fi
+
         printf '%s' "${port}"
         return 0
     done
