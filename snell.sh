@@ -220,9 +220,10 @@ apt_is_busy() {
         fuser /var/lib/dpkg/lock >/dev/null 2>&1 && return 0
         fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && return 0
         fuser /var/cache/apt/archives/lock >/dev/null 2>&1 && return 0
+        return 1
     fi
 
-    ps -eo comm= 2>/dev/null | grep -Eq '^(apt|apt-get|dpkg|unattended-upgr)$'
+    ps -eo args= 2>/dev/null | grep -v -- '--wait-for-signal' | grep -Eq '(^|/)(apt|apt-get|dpkg)\b|unattended-upgr'
 }
 
 apt_lock_details() {
