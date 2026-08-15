@@ -182,14 +182,15 @@ V6L="$(snell_surge_lines v6 1.2.3.4 443 PSK)"
 check "v4 emits one line"            "$(printf '%s\n' "$V4L" | grep -c '^Snell = ')" "1"
 check "v4 uses version = 4"          "$(printf '%s' "$V4L" | grep -c 'version = 4')" "1"
 check "v4 keeps reuse"               "$(printf '%s' "$V4L" | grep -c 'reuse = true')" "1"
+# The reference script emits reuse on every version; do not drop it again.
+check "v5 keeps reuse (per reference)" "$(printf '%s\n' "$V5L" | grep -c 'reuse = true')" "2"
+check "v6 keeps reuse (per reference)" "$(printf '%s' "$V6L" | grep -c 'reuse = true')" "1"
 check "v5 emits two lines"           "$(printf '%s\n' "$V5L" | grep -c '^Snell = ')" "2"
 check "v5 primary is version = 5"    "$(printf '%s\n' "$V5L" | head -1 | grep -c 'version = 5')" "1"
 check "v5 offers v4 compatibility"   "$(printf '%s\n' "$V5L" | grep -c 'version = 4')" "1"
 check "v5 never emits version = 6"   "$(printf '%s' "$V5L" | grep -c 'version = 6')" "0"
-check "v5 line has no reuse"         "$(printf '%s\n' "$V5L" | head -1 | grep -c 'reuse')" "0"
 check "v6 emits one line"            "$(printf '%s\n' "$V6L" | grep -c '^Snell = ')" "1"
 check "v6 uses version = 6"          "$(printf '%s' "$V6L" | grep -c 'version = 6')" "1"
-check "v6 drops the v4-era reuse"    "$(printf '%s' "$V6L" | grep -c 'reuse')" "0"
 if snell_surge_lines unknown 1.2.3.4 443 PSK >/dev/null 2>&1; then
   t_bad "unknown version emits nothing" "it produced a node anyway"
 else t_ok "unknown version emits nothing"; fi

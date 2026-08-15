@@ -1466,26 +1466,31 @@ snell_installed_major() {
 
 # Emits the Surge proxy line(s) for the INSTALLED server major.
 #
-# Per-version rules:
-#   v6 -> version = 6 only. v6 is not backward compatible, and "reuse" is a
-#         v4-era parameter, so it is not emitted.
-#   v5 -> version = 5 as the primary line, plus an optional v4 line because a
-#         v5 server still accepts v4 clients. It does NOT speak v6.
-#   v4 -> version = 4, the only line where "reuse" belongs.
-#   unknown -> nothing. Guessing here hands the user a node that cannot work.
+# The parameter set follows jinqians/snell.sh, which is proven across that
+# script's user base: every version carries "reuse = true, tfo = true".
+# An earlier revision here dropped "reuse" from the v5/v6 lines on the
+# reasoning that it is a v4-era option; that substituted inference for a
+# working reference and is not repeated.
+#
+# Version compatibility (this part is protocol fact, not style):
+#   v6 -> version = 6 only; v6 is not backward compatible.
+#   v5 -> version = 5, plus a v4 line because a v5 server accepts v4 clients.
+#   v4 -> version = 4.
+#   unknown -> nothing; a guessed version simply fails to connect.
 snell_surge_lines() {
     local major="$1" ip="$2" port="$3" psk="$4"
+    local tail_params="reuse = true, tfo = true"
 
     case "${major}" in
         v6)
-            printf 'Snell = snell, %s, %s, psk = %s, version = 6, tfo = true\n' "${ip}" "${port}" "${psk}"
+            printf 'Snell = snell, %s, %s, psk = %s, version = 6, %s\n' "${ip}" "${port}" "${psk}" "${tail_params}"
             ;;
         v5)
-            printf 'Snell = snell, %s, %s, psk = %s, version = 5, tfo = true\n' "${ip}" "${port}" "${psk}"
-            printf 'Snell = snell, %s, %s, psk = %s, version = 4, reuse = true, tfo = true\n' "${ip}" "${port}" "${psk}"
+            printf 'Snell = snell, %s, %s, psk = %s, version = 5, %s\n' "${ip}" "${port}" "${psk}" "${tail_params}"
+            printf 'Snell = snell, %s, %s, psk = %s, version = 4, %s\n' "${ip}" "${port}" "${psk}" "${tail_params}"
             ;;
         v4)
-            printf 'Snell = snell, %s, %s, psk = %s, version = 4, reuse = true, tfo = true\n' "${ip}" "${port}" "${psk}"
+            printf 'Snell = snell, %s, %s, psk = %s, version = 4, %s\n' "${ip}" "${port}" "${psk}" "${tail_params}"
             ;;
         *)
             return 1
