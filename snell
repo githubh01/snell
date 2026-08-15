@@ -68,11 +68,14 @@ VLESS_ALIAS="VLESS-Reality"
 # Reality additionally requires the target to negotiate TLS 1.3 with X25519
 # key exchange. Sites that only offer other groups (www.microsoft.com is a
 # well-known example) fail every handshake even when everything else is right.
-VLESS_DEFAULT_SNI="addons.mozilla.org"
-VLESS_SNI_CANDIDATES="addons.mozilla.org
+# apple.com is the default used by yonggekkk/sing-box-yg, proven across that
+# script's user base. www.microsoft.com was tried here instead and broke every
+# handshake, so the reference default is used rather than a substitute.
+VLESS_DEFAULT_SNI="apple.com"
+VLESS_SNI_CANDIDATES="apple.com
+addons.mozilla.org
 www.lovelive-anime.jp
 gateway.icloud.com
-www.yahoo.com
 dl.google.com"
 
 # All four write to stderr on purpose. Several functions return their value on
