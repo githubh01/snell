@@ -1634,11 +1634,37 @@ sing_box_arch() {
     esac
 }
 
+# Reads the latest release tag.
+#
+# The response must be parsed as JSON, not with a regex: GitHub returns the
+# document on a single line whenever it feels like it, and a greedy sed then
+# captures the last quoted string in the whole payload, which is the final key
+# of the trailing "reactions" object ("eyes"). That produced download URLs for
+# a nonexistent release called "eyes". The result is also format-checked so a
+# rate-limit or error body can never be mistaken for a version.
 sing_box_latest_version() {
-    local version
+    local body
+    local version=""
 
-    version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-    [ -n "${version}" ] || return 1
+    body="$(curl -fsSL --connect-timeout 10 \
+        -H 'Accept: application/vnd.github+json' \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+    [ -n "${body}" ] || return 1
+
+    if has_command jq; then
+        version="$(printf '%s' "${body}" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    fi
+    if [ -z "${version}" ]; then
+        # Non-greedy fallback: take only the value that follows "tag_name".
+        version="$(printf '%s' "${body}" \
+            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | head -n1 \
+            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' || true)"
+    fi
+
+    # A real tag looks like v1.13.18; anything else means we parsed noise.
+    [[ "${version}" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-zA-Z0-9.-]*)$ ]] || return 1
+
     printf '%s' "${version}"
 }
 
@@ -1663,10 +1689,10 @@ install_sing_box_binary() {
     mkdir -p "$(dirname "${dest}")"
 
     if ! version="$(sing_box_latest_version)"; then
-        fail_step "sing-box version lookup" \
-            "Could not read the latest release tag from api.github.com." \
-            "- The server may not reach api.github.com (DNS, firewall, or rate limit).
-- Try again in a few minutes if you hit the GitHub API rate limit." \
+        fail_step "sing-box 版本查询" \
+            "无法从 api.github.com 读取最新版本号。" \
+            "- 服务器可能访问不了 api.github.com（DNS、防火墙或触发限流）。
+- 若是 GitHub API 限流，等几分钟后重试即可。" \
             "curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest"
         return 1
     fi

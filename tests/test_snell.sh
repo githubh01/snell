@@ -400,6 +400,34 @@ service_config_is_stale u.service "$STALE_CFG"; rc=$?
 check "no timestamp = undeterminable" "$rc" "2"
 unset -f systemctl service_is_active
 
+echo "== 22. GitHub release tag parsing =="
+# Regression: a greedy sed captured the last quoted string in a single-line
+# API response, which is the trailing reactions key "eyes", producing a
+# download URL for a release that does not exist.
+parse_tag() {
+  local body="$1" v=""
+  if command -v jq >/dev/null 2>&1; then
+    v="$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  fi
+  if [ -z "$v" ]; then
+    v="$(printf '%s' "$body" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' || true)"
+  fi
+  [[ "$v" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-zA-Z0-9.-]*)$ ]] || return 1
+  printf '%s' "$v"
+}
+COMPACT='{"tag_name":"v1.13.18","name":"1.13.18","reactions":{"total_count":5,"+1":0,"heart":1,"rocket":0,"eyes":2}}'
+check "single-line JSON is parsed, not 'eyes'" "$(parse_tag "$COMPACT")" "v1.13.18"
+PRETTY="$(printf '{\n  "tag_name": "v1.13.18",\n  "reactions": { "eyes": 2 }\n}')"
+check "pretty-printed JSON is parsed" "$(parse_tag "$PRETTY")" "v1.13.18"
+if parse_tag '{"message":"API rate limit exceeded","documentation_url":"https://x"}' >/dev/null 2>&1; then
+  t_bad "rate-limit body is rejected" "accepted as a version"
+else t_ok "rate-limit body is rejected"; fi
+if parse_tag '' >/dev/null 2>&1; then t_bad "empty body is rejected" "accepted"; else t_ok "empty body is rejected"; fi
+if parse_tag '{"tag_name":"eyes"}' >/dev/null 2>&1; then
+  t_bad "non-version tag is rejected" "accepted"
+else t_ok "non-version tag is rejected"; fi
+
 echo
 echo "=================================="
 echo " PASS: $PASS   FAIL: $FAIL"
