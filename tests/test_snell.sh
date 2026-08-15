@@ -281,18 +281,29 @@ for pair in "1:keep" "2:regenerate" "3:show" "0:cancel" "9:cancel"; do
   got="$(echo "$inp" | snell_existing_config_choice 2>/dev/null)"
   check "chooser input '$inp' returns '$want'" "$got" "$want"
 done
+# The chooser now probes the target; stub the probe so the suite stays
+# hermetic and tests the return value rather than the network.
+_real_probe="$(declare -f reality_target_is_suitable)"
+reality_target_is_suitable() { return 0; }
+
 got="$(printf '6\nwww.example.com\n' | vless_prompt_sni 2>/dev/null)"
 check "custom SNI returns only the hostname" "$got" "www.example.com"
-got="$(printf '\n' | vless_prompt_sni 2>/dev/null)"
-check "default SNI returns only the hostname" "$got" "$VLESS_DEFAULT_SNI"
 got="$(printf '2\n' | vless_prompt_sni 2>/dev/null)"
-check "listed SNI returns only the hostname" "$got" "www.bing.com"
+SECOND_CANDIDATE="$(printf '%s\n' "$VLESS_SNI_CANDIDATES" | sed -n 2p)"
+check "listed SNI returns only the hostname" "$got" "$SECOND_CANDIDATE"
+
+# An unsuitable target must be rejected, not silently accepted.
+reality_target_is_suitable() { case "$1" in bad.example.com) return 1 ;; *) return 0 ;; esac; }
+got="$(printf '6\nbad.example.com\n6\nwww.example.com\n' | vless_prompt_sni 2>/dev/null)"
+check "unsuitable target is rejected and re-prompted" "$got" "www.example.com"
+reality_target_is_suitable() { return 0; }
 
 # A polluted SNI would corrupt the Reality config, so assert it stays usable.
 SNI_OUT="$(printf '6\nwww.example.com\n' | vless_prompt_sni 2>/dev/null)"
 write_vless_config 8443 "$UUID" "$SNI_OUT" "$PRIV" "$SID"
 if jq -e . "$VLESS_CONFIG" >/dev/null 2>&1; then t_ok "config built from prompted SNI is valid JSON"; else t_bad "config built from prompted SNI is valid JSON" ""; fi
 check "prompted SNI lands intact in config" "$(vless_cfg_sni)" "www.example.com"
+eval "$_real_probe"
 
 echo "== 18. Status helpers write diagnostics to stderr, not stdout =="
 # info/ok/warn are diagnostics; nothing that returns data may emit them on stdout.

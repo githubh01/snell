@@ -65,12 +65,15 @@ VLESS_ALIAS="VLESS-Reality"
 # Reality handshake targets. These are third-party TLS 1.3 sites used as a
 # masquerade front; they are never the operator's own domain and never need
 # DNS pointing at this server.
-VLESS_DEFAULT_SNI="www.microsoft.com"
-VLESS_SNI_CANDIDATES="www.microsoft.com
-www.bing.com
-addons.mozilla.org
-itunes.apple.com
-www.icloud.com"
+# Reality additionally requires the target to negotiate TLS 1.3 with X25519
+# key exchange. Sites that only offer other groups (www.microsoft.com is a
+# well-known example) fail every handshake even when everything else is right.
+VLESS_DEFAULT_SNI="addons.mozilla.org"
+VLESS_SNI_CANDIDATES="addons.mozilla.org
+www.lovelive-anime.jp
+gateway.icloud.com
+www.yahoo.com
+dl.google.com"
 
 # All four write to stderr on purpose. Several functions return their value on
 # stdout via command substitution; if status messages went to stdout too they
@@ -2920,6 +2923,46 @@ vless_prompt_port() {
     done
 }
 
+# Reality needs the handshake target to speak TLS 1.3 AND to negotiate the
+# X25519 group. A target that only offers other groups makes every Reality
+# handshake fail while every other check still looks healthy.
+# Returns 0 suitable, 1 unsuitable, 2 could not test.
+reality_target_is_suitable() {
+    local host="$1"
+    local out
+
+    has_command openssl || return 2
+    has_command timeout || return 2
+
+    out="$(timeout 12 openssl s_client -connect "${host}:443" -servername "${host}" \
+        -tls1_3 -groups X25519 </dev/null 2>&1 || true)"
+
+    printf '%s' "${out}" | grep -q "CONNECTED" || return 1
+    printf '%s' "${out}" | grep -qE "TLSv1\.3" || return 1
+    # OpenSSL reports the negotiated group; if it names one, it must be X25519.
+    if printf '%s' "${out}" | grep -qE "Negotiated TLS1\.3 group"; then
+        printf '%s' "${out}" | grep -qE "Negotiated TLS1\.3 group: *X25519" || return 1
+    fi
+    return 0
+}
+
+# Probes the built-in candidates and returns the first one this server can
+# actually use, so the default is never a target that cannot work here.
+reality_pick_working_target() {
+    local candidate
+
+    while IFS= read -r candidate; do
+        [ -n "${candidate}" ] || continue
+        if reality_target_is_suitable "${candidate}"; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done <<EOF
+${VLESS_SNI_CANDIDATES}
+EOF
+    return 1
+}
+
 # Reality handshake target ("masquerade site"). Deliberately NOT called a
 # domain prompt: it must be a third-party site, never the user's own domain.
 vless_prompt_sni() {
@@ -2955,30 +2998,57 @@ EOF
             [ -n "${current}" ] && echo "Current value: ${current}"
         } >&2
 
-        read -rp "Select [1-$(( ${#list[@]} + 1 )), Enter = ${VLESS_DEFAULT_SNI}]: " choice
+        read -rp "Select [1-$(( ${#list[@]} + 2 )), Enter = auto-select]: " choice
 
-        if [ -z "${choice}" ]; then
+        # Auto-select probes the candidates and keeps the first one that this
+        # server can genuinely complete a TLS 1.3 + X25519 handshake with.
+        if [ -z "${choice}" ] || [ "${choice}" = "$(( ${#list[@]} + 2 ))" ]; then
+            info "Testing candidates for TLS 1.3 + X25519 from this server..." >&2
+            if domain="$(reality_pick_working_target)"; then
+                ok "Selected ${domain} (verified suitable)." >&2
+                printf '%s' "${domain}"
+                return 0
+            fi
+            warn "No candidate passed the check from this server." >&2
+            warn "Falling back to ${VLESS_DEFAULT_SNI}; verify it afterwards." >&2
             printf '%s' "${VLESS_DEFAULT_SNI}"
             return 0
         fi
 
         if [[ "${choice}" =~ ^[0-9]+$ ]] && [ "${choice}" -ge 1 ] && [ "${choice}" -le "${#list[@]}" ]; then
-            printf '%s' "${list[$((choice - 1))]}"
-            return 0
-        fi
-
-        if [ "${choice}" = "$(( ${#list[@]} + 1 ))" ]; then
+            domain="${list[$((choice - 1))]}"
+        elif [ "${choice}" = "$(( ${#list[@]} + 1 ))" ]; then
             read -rp "Third-party site hostname (e.g. www.example.com): " domain
             if ! is_valid_domain "${domain}"; then
                 err "Not a valid hostname: ${domain}"
                 continue
             fi
-            warn "Make sure ${domain} is a real TLS 1.3 site that does NOT resolve to this server."
-            printf '%s' "${domain}"
-            return 0
+        else
+            err "Please choose a listed option."
+            continue
         fi
 
-        err "Please choose a listed option."
+        # Verify before accepting: an unsuitable target makes every Reality
+        # handshake fail while all the other checks still look fine.
+        info "Checking ${domain} for TLS 1.3 + X25519..." >&2
+        reality_target_is_suitable "${domain}"
+        case "$?" in
+            0)
+                ok "${domain} is suitable." >&2
+                printf '%s' "${domain}"
+                return 0
+                ;;
+            2)
+                warn "Could not test ${domain} (openssl/timeout missing); accepting it." >&2
+                printf '%s' "${domain}"
+                return 0
+                ;;
+            *)
+                err "${domain} does NOT offer TLS 1.3 with X25519 from this server." >&2
+                err "Reality cannot work with it. Choose another target." >&2
+                continue
+                ;;
+        esac
     done
 }
 
@@ -3921,12 +3991,28 @@ vless_diagnose() {
         if printf '%s' "${tls_out}" | grep -q "CONNECTED"; then
             ok "   This server can reach ${sni}:443"
             if printf '%s' "${tls_out}" | grep -qE "Protocol *: *TLSv1\.3|TLSv1\.3"; then
-                ok "   ${sni} negotiates TLS 1.3 (required by Reality)."
+                ok "   ${sni} negotiates TLS 1.3."
             else
                 err "   ${sni} did NOT negotiate TLS 1.3. Reality requires a TLS 1.3 target."
                 warn "   Change it from the VLESS menu: 'Change masquerade SNI'."
                 problems=$((problems + 1))
             fi
+
+            # X25519 is a separate, equally hard requirement. A target can pass
+            # every other check and still break every Reality handshake here.
+            reality_target_is_suitable "${sni}"
+            case "$?" in
+                0) ok "   ${sni} supports X25519 key exchange (required by Reality)." ;;
+                2) warn "   Could not test X25519 support for ${sni}." ;;
+                *)
+                    err "   ${sni} does NOT offer TLS 1.3 with X25519 key exchange."
+                    err "   Reality REQUIRES this. Every handshake will fail, which is"
+                    err "   exactly the 'processed invalid connection' you are seeing."
+                    warn "   Fix: VLESS menu -> 'Change masquerade SNI' -> press Enter"
+                    warn "   to auto-select a target verified to work from this server."
+                    problems=$((problems + 1))
+                    ;;
+            esac
         else
             err "   This server CANNOT reach ${sni}:443"
             err "   Reality relays the TLS handshake to this site, so it cannot work."
