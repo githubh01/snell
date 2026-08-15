@@ -297,6 +297,47 @@ activate_and_verify() {
     return 0
 }
 
+# A running service keeps serving whatever config it loaded at start. If the
+# config file has been rewritten since, the process is serving stale
+# credentials: the file on disk validates, clients are handed values from the
+# file, and the live service rejects every one of them.
+# Returns 0 when the unit is stale, 1 when current, 2 when undeterminable.
+service_config_is_stale() {
+    local unit="$1"
+    local config="$2"
+    local started_epoch
+    local config_epoch
+    local started_raw
+
+    [ -f "${config}" ] || return 2
+    service_is_active "${unit}" || return 1
+
+    started_raw="$(systemctl show "${unit}" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+    [ -n "${started_raw}" ] || return 2
+
+    started_epoch="$(date -d "${started_raw}" +%s 2>/dev/null || true)"
+    config_epoch="$(stat -c %Y "${config}" 2>/dev/null || true)"
+    [ -n "${started_epoch}" ] && [ -n "${config_epoch}" ] || return 2
+
+    # Allow a couple of seconds: a normal apply writes then immediately restarts.
+    [ "${config_epoch}" -gt "$((started_epoch + 2))" ]
+}
+
+# Confirms the live process was actually launched with the config this script
+# manages, rather than some other file left behind by a previous setup.
+service_running_config_path() {
+    local unit="$1"
+    local pid
+    local args
+
+    pid="$(systemctl show "${unit}" -p MainPID --value 2>/dev/null || true)"
+    [ -n "${pid}" ] && [ "${pid}" != "0" ] || return 1
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+
+    args="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+    printf '%s' "${args}" | grep -oE '\-c +[^ ]+' | awk '{print $2}' | head -n1
+}
+
 detect_public_ipv4() {
     curl -fsSL --connect-timeout 5 -4 https://api.ipify.org 2>/dev/null || true
 }
@@ -3775,6 +3816,31 @@ vless_diagnose() {
         err "1. Service ${VLESS_SERVICE_NAME} is NOT active."
         problems=$((problems + 1))
         journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 20 >&2 || true
+    fi
+
+    # 1b. Staleness. A process started before the current config keeps serving
+    #     the old keys, so the file validates while every client is rejected.
+    local running_cfg
+    if service_config_is_stale "${VLESS_SERVICE_NAME}" "${VLESS_CONFIG}"; then
+        err "1b. The RUNNING service is older than ${VLESS_CONFIG}."
+        err "    It is still serving the previous keys, so the current share link"
+        err "    cannot authenticate. This alone explains 'invalid connection'."
+        warn "    Fix it now with:  systemctl restart ${VLESS_SERVICE_NAME}"
+        warn "    (or use 'Repair install' from the VLESS menu)"
+        problems=$((problems + 1))
+    else
+        case "$?" in
+            1) ok "1b. The running service matches the current config file." ;;
+            *) warn "1b. Could not determine whether the running service is current." ;;
+        esac
+    fi
+
+    running_cfg="$(service_running_config_path "${VLESS_SERVICE_NAME}" 2>/dev/null || true)"
+    if [ -n "${running_cfg}" ] && [ "${running_cfg}" != "${VLESS_CONFIG}" ]; then
+        err "    The live process was started with a different config file:"
+        err "      running: ${running_cfg}"
+        err "      managed: ${VLESS_CONFIG}"
+        problems=$((problems + 1))
     fi
 
     # 2. Config accepted by this sing-box build

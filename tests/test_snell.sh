@@ -351,6 +351,41 @@ else t_ok "distinct keys derive distinct public keys"; fi
 check "b64url round-trip" "$(b64url_decode "$KPUB" | b64url_encode)" "$KPUB"
 if b64url_decode >/dev/null 2>&1; then t_bad "b64url_decode rejects no argument" "accepted"; else t_ok "b64url_decode rejects no argument"; fi
 
+echo "== 21. Stale-service detection =="
+# A process started before the current config keeps serving the old keys:
+# the file validates, clients get values from the file, and the live service
+# rejects all of them. That must be detected, not silently ignored.
+STALE_CFG="$SANDBOX/stale.json"
+STARTED_AT="Sat 2026-08-15 08:03:00 UTC"
+systemctl() {
+  case "$*" in
+    *ExecMainStartTimestamp*) printf '%s\n' "$STARTED_AT" ;;
+    *MainPID*) printf '0\n' ;;
+  esac
+}
+service_is_active() { return 0; }
+
+touch -d "2026-08-15 08:02:00 UTC" "$STALE_CFG"
+service_config_is_stale u.service "$STALE_CFG"; rc=$?
+check "config older than service = current" "$rc" "1"
+
+touch -d "2026-08-15 08:20:00 UTC" "$STALE_CFG"
+service_config_is_stale u.service "$STALE_CFG"; rc=$?
+check "config newer than service = STALE" "$rc" "0"
+
+touch -d "2026-08-15 08:03:01 UTC" "$STALE_CFG"
+service_config_is_stale u.service "$STALE_CFG"; rc=$?
+check "write inside restart window = current" "$rc" "1"
+
+service_config_is_stale u.service "$SANDBOX/does-not-exist"; rc=$?
+check "missing config = undeterminable" "$rc" "2"
+
+STARTED_AT=""
+touch -d "2026-08-15 08:20:00 UTC" "$STALE_CFG"
+service_config_is_stale u.service "$STALE_CFG"; rc=$?
+check "no timestamp = undeterminable" "$rc" "2"
+unset -f systemctl service_is_active
+
 echo
 echo "=================================="
 echo " PASS: $PASS   FAIL: $FAIL"
