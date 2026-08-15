@@ -327,6 +327,30 @@ check "probe fallback reports unknown, not listening" "$rc" "2"
 eval "$_real_has_command"
 kill "$PROBE_PID" 2>/dev/null; wait "$PROBE_PID" 2>/dev/null || true
 
+echo "== 20. Reality X25519 public-key derivation =="
+# The advertised public key must provably belong to the server's private key;
+# a mismatch is what produces "REALITY: processed invalid connection".
+openssl genpkey -algorithm X25519 -out "$SANDBOX/kp.pem" 2>/dev/null
+KPRIV="$(openssl pkey -in "$SANDBOX/kp.pem" -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+KPUB="$(openssl pkey -in "$SANDBOX/kp.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+check "derives the correct public key" "$(vless_derive_reality_public_key "$KPRIV")" "$KPUB"
+check "derived key is 43 base64url chars" "${#KPUB}" "43"
+if vless_derive_reality_public_key "not-a-real-key" >/dev/null 2>&1; then
+  t_bad "rejects a malformed private key" "accepted"
+else t_ok "rejects a malformed private key"; fi
+if vless_derive_reality_public_key "" >/dev/null 2>&1; then
+  t_bad "rejects an empty private key" "accepted"
+else t_ok "rejects an empty private key"; fi
+# A different key must not derive to the same public key.
+openssl genpkey -algorithm X25519 -out "$SANDBOX/kp2.pem" 2>/dev/null
+KPRIV2="$(openssl pkey -in "$SANDBOX/kp2.pem" -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+if [ "$(vless_derive_reality_public_key "$KPRIV2")" = "$KPUB" ]; then
+  t_bad "distinct keys derive distinct public keys" "collision"
+else t_ok "distinct keys derive distinct public keys"; fi
+# base64url round-trip
+check "b64url round-trip" "$(b64url_decode "$KPUB" | b64url_encode)" "$KPUB"
+if b64url_decode >/dev/null 2>&1; then t_bad "b64url_decode rejects no argument" "accepted"; else t_ok "b64url_decode rejects no argument"; fi
+
 echo
 echo "=================================="
 echo " PASS: $PASS   FAIL: $FAIL"

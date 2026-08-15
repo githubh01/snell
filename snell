@@ -2985,6 +2985,55 @@ vless_gen_short_id() {
     printf '%s' "${value}"
 }
 
+b64url_decode() {
+    local s="${1:-}"
+    local pad
+    local i
+
+    [ -n "${s}" ] || return 1
+    pad=$(( (4 - ${#s} % 4) % 4 ))
+
+    for (( i=0; i<pad; i++ )); do
+        s="${s}="
+    done
+    printf '%s' "${s}" | tr '_-' '/+' | base64 -d 2>/dev/null
+}
+
+b64url_encode() {
+    base64 2>/dev/null | tr '+/' '-_' | tr -d '=\n'
+}
+
+# Derives the X25519 public key from a raw Reality private key by rebuilding a
+# PKCS#8 wrapper around the 32 key bytes. Lets the diagnostics prove that the
+# public key handed to clients really belongs to the server's private key.
+vless_derive_reality_public_key() {
+    local priv="$1"
+    local tmpd
+    local size
+    local derived
+
+    has_command openssl || return 1
+    tmpd="$(mktemp -d)"
+
+    b64url_decode "${priv}" > "${tmpd}/raw.priv" 2>/dev/null
+    size="$(wc -c < "${tmpd}/raw.priv" 2>/dev/null || echo 0)"
+    if [ "${size}" -ne 32 ]; then
+        rm -rf "${tmpd}"
+        return 1
+    fi
+
+    # PKCS#8 PrivateKeyInfo header for an X25519 key with a 32-byte payload.
+    printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20' > "${tmpd}/pkcs8.der"
+    cat "${tmpd}/raw.priv" >> "${tmpd}/pkcs8.der"
+
+    derived="$(openssl pkey -inform DER -in "${tmpd}/pkcs8.der" -pubout -outform DER 2>/dev/null \
+        | tail -c 32 | b64url_encode)"
+    rm -rf "${tmpd}"
+
+    [ -n "${derived}" ] || return 1
+    printf '%s' "${derived}"
+}
+
 # Returns "private|public". Handles both "PrivateKey: x" and "PrivateKey x".
 vless_gen_reality_keypair() {
     local output
@@ -3652,6 +3701,55 @@ vless_diagnose() {
             warn "   Clock is NOT NTP-synchronised. Reality is time-sensitive."
             warn "   Fix with: timedatectl set-ntp true"
         fi
+    fi
+
+    # 6b. Reality credential integrity. "processed invalid connection" in the
+    #     log means the client failed Reality authentication, so verify the
+    #     advertised public key really derives from the server's private key.
+    echo
+    info "6b. Reality credentials"
+    local priv derived
+    priv="$(vless_cfg_priv 2>/dev/null || true)"
+
+    if [ "${#pub}" -eq 43 ] && [[ "${pub}" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+        ok "   Public key format looks correct (43 base64url chars)."
+    else
+        err "   Public key looks malformed: '${pub}' (${#pub} chars, expected 43)."
+        problems=$((problems + 1))
+    fi
+
+    if [[ "${sid}" =~ ^([0-9a-f]{2}){1,8}$ ]]; then
+        ok "   Short ID format looks correct (${sid})."
+    else
+        err "   Short ID looks malformed: '${sid}' (expected 2-16 hex chars)."
+        problems=$((problems + 1))
+    fi
+
+    if [ -n "${priv}" ] && derived="$(vless_derive_reality_public_key "${priv}")"; then
+        if [ "${derived}" = "${pub}" ]; then
+            ok "   Public key matches the server's private key."
+        else
+            err "   MISMATCH: the stored public key does not belong to the private key."
+            err "     stored : ${pub}"
+            err "     derived: ${derived}"
+            warn "   Clients using the stored key can never authenticate."
+            warn "   Fix by giving clients the derived key above, or regenerate the"
+            warn "   key pair from the VLESS menu ('Regenerate Reality key pair')."
+            problems=$((problems + 1))
+        fi
+    else
+        warn "   Could not derive the public key locally; skipping this check."
+    fi
+
+    if journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 500 2>/dev/null \
+        | grep -q "REALITY: processed invalid connection"; then
+        echo
+        warn "   The log shows 'REALITY: processed invalid connection'."
+        warn "   That means clients ARE reaching this server but failing Reality"
+        warn "   authentication. Network, port and firewall are therefore fine."
+        warn "   Re-copy the full share link from menu option 3 rather than typing"
+        warn "   the public key by hand: a single wrong or missing character in"
+        warn "   pbk or sid produces exactly this error."
     fi
 
     # 7. Effective client parameters
