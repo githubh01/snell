@@ -1466,6 +1466,142 @@ snell_logs() {
     journalctl -u snell --no-pager -n 80 || true
 }
 
+# Returns the port the live snell-server process is actually bound to, which
+# is not necessarily the one in the config file if the service never
+# restarted after an edit.
+snell_listening_port() {
+    local pid
+
+    pid="$(systemctl show snell -p MainPID --value 2>/dev/null || true)"
+    [ -n "${pid}" ] && [ "${pid}" != "0" ] || return 1
+
+    if has_command ss; then
+        ss -tlnp 2>/dev/null | grep "pid=${pid}," | grep -oE '[:.]([0-9]+) ' | tr -d ': ' | head -n1
+        return 0
+    fi
+    if has_command lsof; then
+        lsof -Pan -p "${pid}" -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR==2{split($9,a,":"); print a[length(a)]}'
+        return 0
+    fi
+    return 1
+}
+
+# Snell has no client this script can drive, so instead of an end-to-end
+# test this proves every server-side fact and prints the exact Surge line.
+snell_diagnose() {
+    local cfg_port live_port psk major problems=0
+
+    require_root
+
+    echo
+    info "=== Snell 连接诊断 ==="
+    warn "注意：ping 走 ICMP，与 Snell 无关。很多 VPS 屏蔽 ICMP 但 TCP 正常，"
+    warn "用 ping 判断 Snell 通不通是无效的。请以下面各项为准。"
+
+    # 1. config
+    echo
+    if snell_config_is_valid; then
+        ok "1. 配置文件有效：${MAIN_CONF}"
+    else
+        err "1. 配置缺失或不完整：${MAIN_CONF}"
+        problems=$((problems + 1))
+    fi
+    cfg_port="$(snell_main_port)"
+    psk="$(snell_main_psk)"
+    echo "   配置端口：${cfg_port:-未知}"
+
+    # 2. binary
+    if [ -x "${SNELL_BIN}" ] && "${SNELL_BIN}" --v >/dev/null 2>&1; then
+        major="$(snell_installed_major)"
+        ok "2. 程序可运行：$("${SNELL_BIN}" --v 2>&1 | head -n1)"
+    else
+        err "2. ${SNELL_BIN} 缺失或无法运行。"
+        problems=$((problems + 1))
+        major="unknown"
+    fi
+
+    # 3. service
+    if service_is_active snell; then
+        ok "3. 服务 snell 正在运行。"
+    else
+        err "3. 服务 snell 未运行。"
+        problems=$((problems + 1))
+        journalctl -u snell --no-pager -n 20 >&2 || true
+    fi
+
+    # 3b. The port actually bound must match the config, otherwise the service
+    #     is still serving the pre-edit port and clients hit nothing.
+    live_port="$(snell_listening_port 2>/dev/null || true)"
+    if [ -n "${live_port}" ] && [ -n "${cfg_port}" ]; then
+        if [ "${live_port}" = "${cfg_port}" ]; then
+            ok "3b. 实际监听端口与配置一致：${live_port}"
+        else
+            err "3b. 实际监听端口是 ${live_port}，但配置写的是 ${cfg_port}。"
+            err "     服务没有加载最新配置，客户端连 ${cfg_port} 会连到空气。"
+            warn "     修复：systemctl restart snell"
+            problems=$((problems + 1))
+        fi
+    fi
+
+    # 4. listener + local TCP accept
+    echo
+    port_is_listening "${cfg_port}" 1
+    case "$?" in
+        0)
+            ok "4. 端口 ${cfg_port} 正在监听。"
+            if tcp_probe_port "${cfg_port}"; then
+                ok "   本机 TCP 连接测试通过（服务端能接受连接）。"
+            else
+                warn "   本机 TCP 连接测试失败，服务可能只绑定了外网地址。"
+            fi
+            ;;
+        2) warn "4. 无法验证端口监听（缺少 ss/netstat/lsof）。" ;;
+        *)
+            err "4. 端口 ${cfg_port} 上没有任何监听。"
+            problems=$((problems + 1))
+            ;;
+    esac
+
+    # 5. firewall
+    echo
+    info "5. 端口 ${cfg_port} 的防火墙检查"
+    report_firewall_for_port "${cfg_port}"
+
+    # 6. the exact client line, derived from the installed major version
+    echo
+    info "6. 客户端配置（请直接复制整行到 Surge）"
+    local ip v
+    ip="$(client_endpoint_host)"
+    for v in $(snell_surge_versions "${major}"); do
+        echo "   Snell = snell, ${ip}, ${cfg_port}, psk = ${psk}, version = ${v}, reuse = true, tfo = true"
+    done
+    warn "   已安装的是 Snell ${major}。version 参数必须用上面列出的值，"
+    warn "   填错版本号会直接连不上。"
+
+    # 7. errors
+    echo
+    info "7. 服务报错"
+    if journalctl -u snell --no-pager --since '-5 min' 2>/dev/null \
+        | grep -iE "error|fatal|refused|denied" | tail -n 5 | grep -q .; then
+        journalctl -u snell --no-pager --since '-5 min' 2>/dev/null \
+            | grep -iE "error|fatal|refused|denied" | tail -n 5 | sed 's/^/   /'
+        problems=$((problems + 1))
+    else
+        ok "   最近 5 分钟无报错。"
+    fi
+
+    echo
+    if [ "${problems}" -eq 0 ]; then
+        ok "服务端未发现问题。若客户端仍连不上，请依次确认："
+        echo "   1) 云服务商安全组 / 家宽路由器是否放行 TCP ${cfg_port}"
+        echo "   2) 客户端的端口、PSK、version 是否与第 6 项完全一致"
+        echo "   3) 不要用 ping 测试，改用客户端自身的延迟测试"
+    else
+        err "发现 ${problems} 处服务端问题，请修复上面标红的项。"
+    fi
+    return 0
+}
+
 change_snell_port() {
     local port psk dns
 
@@ -1533,10 +1669,11 @@ snell_menu() {
         echo "10. 查看服务状态"
         echo "11. 查看日志"
         echo "12. 多用户配置管理"
-        echo "13. 卸载 Snell"
+        echo "13. 连接诊断（连不上时用）"
+        echo "14. 卸载 Snell"
         echo "0. 返回上级"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "请选择 [0-13]: " choice
+        read -rp "请选择 [0-14]: " choice
         case "${choice}" in
             1) install_snell || true ;;
             2) update_snell || true ;;
@@ -1550,7 +1687,8 @@ snell_menu() {
             10) service_status ;;
             11) snell_logs ;;
             12) user_menu ;;
-            13) uninstall_snell ;;
+            13) snell_diagnose || true ;;
+            14) uninstall_snell ;;
             0) return 0 ;;
             *) err "无效选项。" ;;
         esac
