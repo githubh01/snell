@@ -442,6 +442,56 @@ if parse_tag '{"tag_name":"eyes"}' >/dev/null 2>&1; then
   t_bad "non-version tag is rejected" "accepted"
 else t_ok "non-version tag is rejected"; fi
 
+echo "== 23. Version-aware Snell config (verified against real binaries) =="
+# Established by running snell-server v4.1.1 / v5.0.1 / v6.0.0rc2:
+# v6 rejects a PSK under 12 bytes; v4/v5 do not. ::0: fails to bind on an
+# IPv4-only host. v6 uses dns-ip-preference instead of the ipv6 boolean.
+SERVICE_USER=root; SERVICE_GROUP=root
+for m in v4 v5 v6; do
+  write_config "$SANDBOX/$m.conf" 39000 "AnAcceptablePSK123" "1.1.1.1" "$m"
+done
+check "v6 uses dns-ip-preference"  "$(grep -c '^dns-ip-preference' "$SANDBOX/v6.conf")" "1"
+check "v6 drops the ipv6 boolean"  "$(grep -c '^ipv6' "$SANDBOX/v6.conf")" "0"
+check "v5 keeps the ipv6 boolean"  "$(grep -c '^ipv6' "$SANDBOX/v5.conf")" "1"
+check "v5 has no dns-ip-preference" "$(grep -c '^dns-ip-preference' "$SANDBOX/v5.conf")" "0"
+if grep -q '^listen = ::0:' "$SANDBOX/v4.conf" && ! host_supports_ipv6; then
+  t_bad "listen matches the host stack" "emitted ::0: on an IPv4-only host"
+else t_ok "listen matches the host stack"; fi
+# v6 dns-ip-preference must be one of the values the binary accepts.
+V6PREF="$(sed -nE 's/^dns-ip-preference = (.*)$/\1/p' "$SANDBOX/v6.conf")"
+case "$V6PREF" in
+  default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only) t_ok "dns-ip-preference value is valid ($V6PREF)" ;;
+  *) t_bad "dns-ip-preference value is valid" "got '$V6PREF'" ;;
+esac
+
+echo "== 24. PSK validation matches the binaries =="
+for n in 10 11; do
+  P="$(printf 'A%.0s' $(seq $n))"
+  if snell_validate_psk v6 "$P" >/dev/null 2>&1; then t_bad "v6 rejects a ${n}-byte PSK" "accepted"; else t_ok "v6 rejects a ${n}-byte PSK"; fi
+  if snell_validate_psk v5 "$P" >/dev/null 2>&1; then t_ok "v5 accepts a ${n}-byte PSK"; else t_bad "v5 accepts a ${n}-byte PSK" "rejected"; fi
+done
+P12="$(printf 'A%.0s' $(seq 12))"
+if snell_validate_psk v6 "$P12" >/dev/null 2>&1; then t_ok "v6 accepts a 12-byte PSK"; else t_bad "v6 accepts a 12-byte PSK" "rejected"; fi
+for bad in "has space" "has,comma" "has=equals"; do
+  if snell_validate_psk v6 "${bad}padding123" >/dev/null 2>&1; then
+    t_bad "PSK with '$bad' is rejected" "accepted"
+  else t_ok "PSK with '$bad' is rejected"; fi
+done
+check "generated PSK satisfies v6" "$(P="$(random_psk)"; snell_validate_psk v6 "$P" >/dev/null 2>&1 && echo ok)" "ok"
+
+echo "== 25. Single-key edits preserve the rest of the config =="
+KC="$SANDBOX/keep.conf"
+printf '[snell-server]\nlisten = 0.0.0.0:1111\npsk = Orig123456789\nipv6 = false\ndns = 1.1.1.1\nobfs = http\ntfo = true\negress-interface = eth1\n' > "$KC"
+snell_set_config_key "$KC" listen "0.0.0.0:2222"
+snell_set_config_key "$KC" psk "New1234567890"
+check "listen updated"      "$(sed -nE 's/^listen = (.*)$/\1/p' "$KC")" "0.0.0.0:2222"
+check "psk updated"         "$(sed -nE 's/^psk = (.*)$/\1/p' "$KC")" "New1234567890"
+check "obfs preserved"      "$(grep -c '^obfs' "$KC")" "1"
+check "tfo preserved"       "$(grep -c '^tfo' "$KC")" "1"
+check "egress preserved"    "$(grep -c '^egress-interface' "$KC")" "1"
+snell_set_config_key "$KC" mode "added"
+check "absent key is added"  "$(grep -c '^mode = added' "$KC")" "1"
+
 echo
 echo "=================================="
 echo " PASS: $PASS   FAIL: $FAIL"

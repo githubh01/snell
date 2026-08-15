@@ -903,6 +903,142 @@ resolve_snell_asset() {
     printf '%s|https://dl.nssurge.com/snell/%s' "${version}" "${file}"
 }
 
+# ---------------------------------------------------------------------------
+# Snell facts established by running the official v4.1.1 / v5.0.1 / v6.0.0rc2
+# binaries directly:
+#   * v6 rejects a PSK shorter than 12 bytes ("length must be between 12 and
+#     255 bytes"); v4 and v5 accept any length.
+#   * v6 'dns-ip-preference' accepts exactly:
+#     default, prefer-ipv4, prefer-ipv6, ipv4-only, ipv6-only.
+#   * v6 'listen' accepts one or more addresses, e.g. 0.0.0.0:3000,[::]:3000.
+#   * v5 and v6 bind UDP as well as TCP on the same port (QUIC).
+#   * listen = ::0:PORT fails outright on an IPv4-only host with
+#     "Bind error address family not supported".
+# ---------------------------------------------------------------------------
+
+SNELL_V6_MIN_PSK=12
+
+# Can this host actually bind an IPv6 socket? Presence of an address is not
+# enough: bindv6only and disabled IPv6 both change the answer.
+host_supports_ipv6() {
+    [ -f /proc/net/if_inet6 ] || return 1
+    [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" = "0" ] || return 1
+    (exec 3<>/dev/tcp/::1/1) 2>/dev/null && exec 3>&- || true
+    ip -6 addr show scope global 2>/dev/null | grep -q 'inet6' || return 1
+    return 0
+}
+
+# Validates a PSK for the target major version and reports the real reason.
+# Restores the most recent backup_file() copy, used when a change fails to
+# start so the box is never left on a config that does not work.
+snell_restore_backup() {
+    local path="$1"
+    local latest
+
+    latest="$(ls -1t "${path}".bak.* 2>/dev/null | head -n1 || true)"
+    if [ -z "${latest}" ]; then
+        warn "没有可回滚的备份：${path}"
+        return 1
+    fi
+    cp -a "${latest}" "${path}"
+    warn "已回滚配置：${latest} -> ${path}"
+    systemctl restart snell >/dev/null 2>&1 || true
+    if service_is_active snell; then
+        ok "回滚后服务已恢复运行。"
+    else
+        err "回滚后服务仍未运行，请手动检查。"
+    fi
+    return 0
+}
+
+# v5 and v6 bind UDP as well as TCP on the listen port (QUIC), so both must be
+# free. is_port_used only ever looked at TCP.
+udp_port_is_used() {
+    local port="$1"
+
+    if has_command ss; then
+        ss -uln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$" && return 0
+        return 1
+    fi
+    if has_command lsof; then
+        lsof -iUDP:"${port}" -n -P >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if has_command netstat; then
+        netstat -uln 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$" && return 0
+        return 1
+    fi
+    return 1
+}
+
+# Port prompt that knows which transports the target version needs.
+prompt_port_for_major() {
+    local default_port="${1:-random}"
+    local major="${2:-v5}"
+    local port confirm_low
+
+    while true; do
+        if [ "${default_port}" = "random" ]; then
+            read -rp "监听端口 [回车 = 随机可用端口]: " port
+            [ -n "${port}" ] || { port="$(random_available_port)"; echo "已随机选择端口：${port}" >&2; }
+        else
+            read -rp "监听端口 [默认 ${default_port}]: " port
+            port="${port:-${default_port}}"
+        fi
+
+        if ! valid_port "${port}"; then
+            err "端口必须是 1-65535 之间的数字。"
+            continue
+        fi
+
+        if [ "${port}" != "${default_port}" ]; then
+            if is_port_used "${port}"; then
+                err "TCP 端口 ${port} 已被占用，请换一个。"
+                continue
+            fi
+            # v5/v6 also need the UDP port of the same number.
+            if [ "${major}" != "v4" ] && udp_port_is_used "${port}"; then
+                err "UDP 端口 ${port} 已被占用（Snell ${major} 的 QUIC 需要同号 UDP 端口）。"
+                continue
+            fi
+        fi
+
+        if [ "${port}" -lt 1024 ]; then
+            warn "端口 ${port} 属于系统保留端口（<1024），易与系统服务冲突且常被运营商屏蔽。"
+            read -rp "确定要使用端口 ${port} 吗？[y/N]: " confirm_low
+            [[ "${confirm_low}" =~ ^[Yy]$ ]] || continue
+        fi
+
+        printf '%s' "${port}"
+        return 0
+    done
+}
+
+snell_validate_psk() {
+    local major="$1"
+    local psk="$2"
+
+    if [ -z "${psk}" ]; then
+        err "PSK 不能为空。"
+        return 1
+    fi
+    if [ "${#psk}" -gt 255 ]; then
+        err "PSK 过长（${#psk} 字节），上限 255 字节。"
+        return 1
+    fi
+    if [ "${major}" = "v6" ] && [ "${#psk}" -lt "${SNELL_V6_MIN_PSK}" ]; then
+        err "Snell v6 要求 PSK 至少 ${SNELL_V6_MIN_PSK} 字节，当前只有 ${#psk} 字节。"
+        err "（实测：v6 会直接拒绝启动，v4/v5 则无此限制）"
+        return 1
+    fi
+    # Keep to a set that survives Surge config parsing without quoting.
+    if [[ "${psk}" =~ [[:space:],=\"\'] ]]; then
+        err "PSK 不能包含空格、逗号、等号或引号，否则会破坏客户端配置行。"
+        return 1
+    fi
+    return 0
+}
+
 random_psk() {
     if has_command openssl; then
         openssl rand -base64 24 | tr -d '\n'
@@ -968,22 +1104,83 @@ prompt_dns() {
     printf '%s' "${dns:-1.1.1.1,8.8.8.8}"
 }
 
+# Generates a config appropriate to the target major version AND to this
+# host's actual network stack.
+#
+# The previous single template hardcoded "listen = ::0:PORT" plus
+# "ipv6 = true" for every version, which fails to bind at all on an
+# IPv4-only host and ignores the options v6 actually introduced.
 write_config() {
     local path="$1"
     local port="$2"
     local psk="$3"
     local dns="$4"
+    local major="${5:-v5}"
+    local listen
+    local v6ok=1
 
-    cat > "${path}" <<EOF
-[snell-server]
-listen = ::0:${port}
-psk = ${psk}
-ipv6 = true
-dns = ${dns}
-EOF
+    host_supports_ipv6 && v6ok=0
+
+    if [ "${v6ok}" -eq 0 ]; then
+        if [ "${major}" = "v6" ]; then
+            # v6 takes a list, so bind both families explicitly.
+            listen="0.0.0.0:${port},[::]:${port}"
+        else
+            listen="::0:${port}"
+        fi
+    else
+        listen="0.0.0.0:${port}"
+    fi
+
+    {
+        echo "[snell-server]"
+        echo "listen = ${listen}"
+        echo "psk = ${psk}"
+        if [ "${major}" = "v6" ]; then
+            # v6 replaces the ipv6 boolean with an explicit preference.
+            if [ "${v6ok}" -eq 0 ]; then
+                echo "dns-ip-preference = prefer-ipv4"
+            else
+                echo "dns-ip-preference = ipv4-only"
+            fi
+        else
+            if [ "${v6ok}" -eq 0 ]; then
+                echo "ipv6 = true"
+            else
+                echo "ipv6 = false"
+            fi
+        fi
+        [ -n "${dns}" ] && echo "dns = ${dns}"
+    } > "${path}"
 
     chmod 640 "${path}"
-    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${path}" 2>/dev/null || true
+    chown "root:${SERVICE_GROUP}" "${path}" 2>/dev/null || \
+        chown "${SERVICE_USER}:${SERVICE_GROUP}" "${path}" 2>/dev/null || true
+}
+
+# Rewrites a single key while preserving every other line, so options the
+# user added by hand (mode, obfs, tfo, egress-interface, ...) survive an
+# edit. Adds the key if it is absent.
+snell_set_config_key() {
+    local path="$1"
+    local key="$2"
+    local value="$3"
+    local tmp
+
+    [ -f "${path}" ] || return 1
+    tmp="$(mktemp)"
+
+    if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "${path}"; then
+        sed -E "s|^[[:space:]]*${key}[[:space:]]*=.*$|${key} = ${value}|" "${path}" > "${tmp}"
+    else
+        cp "${path}" "${tmp}"
+        printf '%s = %s\n' "${key}" "${value}" >> "${tmp}"
+    fi
+
+    cat "${tmp}" > "${path}"
+    rm -f "${tmp}"
+    chmod 640 "${path}"
+    return 0
 }
 
 write_service() {
@@ -1014,6 +1211,76 @@ SyslogIdentifier=snell-server
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+SNELL_META="${SNELL_DIR}/installed.meta"
+
+# The binary only ever reports "v6.0.0" even for v6.0.0rc2, so --v cannot tell
+# a release candidate from a stable build. Record what was actually installed.
+snell_write_meta() {
+    mkdir -p "${SNELL_DIR}"
+    printf 'MAJOR=%s\nVERSION=%s\nINSTALLED_AT=%s\n' "$1" "$2" "$(date -u +%FT%TZ)" > "${SNELL_META}"
+    chmod 600 "${SNELL_META}"
+}
+
+snell_meta_get() {
+    [ -f "${SNELL_META}" ] || return 1
+    grep -E "^$1=" "${SNELL_META}" | tail -n1 | cut -d= -f2- || return 1
+}
+
+# Refuses an upgrade that the existing config cannot survive. The concrete
+# case: v6 rejects a PSK under 12 bytes, so a v4/v5 box with a short PSK
+# would install fine and then fail to start.
+snell_check_upgrade_compat() {
+    local target_major="$1"
+    local current_major psk choice
+
+    snell_config_is_valid || return 0
+    current_major="$(snell_installed_major)"
+    psk="$(snell_main_psk)"
+
+    [ "${current_major}" = "${target_major}" ] && return 0
+
+    echo >&2
+    warn "检测到跨版本变更：${current_major} -> ${target_major}"
+
+    if [ "${target_major}" = "v6" ] && [ -n "${psk}" ] && [ "${#psk}" -lt "${SNELL_V6_MIN_PSK}" ]; then
+        err "当前 PSK 只有 ${#psk} 字节，Snell v6 要求至少 ${SNELL_V6_MIN_PSK} 字节。"
+        err "直接升级会导致服务无法启动。"
+        echo "1. 自动生成一个新的合规 PSK（客户端需要同步更新）" >&2
+        echo "0. 取消升级" >&2
+        read -rp "请选择 [0-1]: " choice
+        if [ "${choice}" = "1" ]; then
+            local newpsk
+            newpsk="$(random_psk)"
+            backup_file "${MAIN_CONF}"
+            snell_set_config_key "${MAIN_CONF}" psk "${newpsk}" || return 1
+            ok "已生成新 PSK：${newpsk}"
+            warn "所有客户端都必须更新 PSK。"
+            return 0
+        fi
+        info "已取消。"
+        return 1
+    fi
+
+    warn "客户端的 version 参数需要相应调整（v6 不向下兼容）。"
+    return 0
+}
+
+# Confirms the binary now on disk really is the major that was requested.
+snell_verify_installed_major() {
+    local expected="$1"
+    local actual
+
+    actual="$(snell_installed_major)"
+    if [ "${actual}" != "${expected}" ]; then
+        fail_step "Snell 版本校验" \
+            "期望安装 ${expected}，但实际运行的是 ${actual}。" \
+            "- 下载的安装包可能与所选版本不符。" \
+            "${SNELL_BIN} --v"
+        return 1
+    fi
+    return 0
 }
 
 # Downloads and installs snell-server, proving at each step that the artifact
@@ -1086,7 +1353,10 @@ install_binary() {
         return 1
     fi
 
-    ok "已安装并校验通过：${SNELL_BIN}（$("${SNELL_BIN}" --v 2>&1 | head -n1)）"
+    snell_verify_installed_major "${selected}" || return 1
+    snell_write_meta "${selected}" "${version}"
+
+    ok "已安装并校验通过：${SNELL_BIN}（${version}）"
     return 0
 }
 
@@ -1325,6 +1595,11 @@ install_snell() {
     if ! selected="$(choose_snell_major)"; then
         return 1
     fi
+
+    # Check compatibility BEFORE touching the binary, otherwise a failed
+    # upgrade leaves a new binary against an old, incompatible config.
+    snell_check_upgrade_compat "${selected}" || return 1
+
     install_binary "${selected}" || return 1
 
     if snell_config_is_valid; then
@@ -1360,7 +1635,7 @@ install_snell() {
     port="$(prompt_port random)"
     dns="$(prompt_dns)"
     psk="$(random_psk)"
-    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
+    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}" "${selected}"
     write_service
 
     activate_and_verify "snell" "${port}" "Snell" || return 1
@@ -1390,7 +1665,21 @@ update_snell() {
     if ! selected="$(choose_snell_major)"; then
         return 1
     fi
-    install_binary "${selected}" || return 1
+
+    snell_check_upgrade_compat "${selected}" || return 1
+
+    # Keep the outgoing binary so a failed start can be rolled back.
+    local binbak=""
+    if [ -x "${SNELL_BIN}" ]; then
+        binbak="${SNELL_BIN}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -a "${SNELL_BIN}" "${binbak}"
+    fi
+    backup_file "${MAIN_CONF}"
+
+    if ! install_binary "${selected}"; then
+        [ -n "${binbak}" ] && cp -a "${binbak}" "${SNELL_BIN}" && warn "已回滚到升级前的二进制。"
+        return 1
+    fi
 
     if ! snell_config_is_valid; then
         warn "现有配置缺失或不完整，不启动服务。"
@@ -1400,7 +1689,16 @@ update_snell() {
 
     write_service
     port="$(snell_main_port)"
-    activate_and_verify "snell" "${port}" "Snell" || return 1
+    if ! activate_and_verify "snell" "${port}" "Snell"; then
+        if [ -n "${binbak}" ]; then
+            cp -a "${binbak}" "${SNELL_BIN}"
+            warn "启动失败，已回滚到升级前的二进制。"
+            systemctl restart snell >/dev/null 2>&1 || true
+            service_is_active snell && ok "回滚后服务已恢复。" || err "回滚后仍未恢复，请查看日志。"
+        fi
+        return 1
+    fi
+    [ -n "${binbak}" ] && rm -f "${binbak}"
 
     ok "Snell 程序升级完成，原配置已保留。"
     show_config
@@ -1677,14 +1975,26 @@ change_snell_port() {
         return 1
     fi
 
-    port="$(prompt_port "$(snell_main_port)")"
-    psk="$(snell_main_psk)"
-    dns="$(snell_main_dns)"
-    dns="${dns:-1.1.1.1,8.8.8.8}"
+    local major old_port listen v6ok=1
+    major="$(snell_installed_major)"
+    old_port="$(snell_main_port)"
+    port="$(prompt_port_for_major "${old_port}" "${major}")"
 
     backup_file "${MAIN_CONF}"
-    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
-    activate_and_verify "snell" "${port}" "Snell" || return 1
+    # Only the listen line changes; mode/obfs/tfo/dns-ip-preference and any
+    # hand-added options are preserved.
+    host_supports_ipv6 && v6ok=0
+    if [ "${v6ok}" -eq 0 ]; then
+        if [ "${major}" = "v6" ]; then listen="0.0.0.0:${port},[::]:${port}"; else listen="::0:${port}"; fi
+    else
+        listen="0.0.0.0:${port}"
+    fi
+    snell_set_config_key "${MAIN_CONF}" listen "${listen}" || return 1
+
+    if ! activate_and_verify "snell" "${port}" "Snell"; then
+        snell_restore_backup "${MAIN_CONF}"
+        return 1
+    fi
     show_config
     snell_verify_client_match || true
 }
@@ -1700,15 +2010,24 @@ change_snell_psk() {
         return 1
     fi
 
+    local major
+    major="$(snell_installed_major)"
     port="$(snell_main_port)"
-    dns="$(snell_main_dns)"
-    dns="${dns:-1.1.1.1,8.8.8.8}"
-    read -rp "新的 PSK [回车自动生成]: " psk
-    psk="${psk:-$(random_psk)}"
+
+    while true; do
+        read -rp "新的 PSK [回车自动生成]: " psk
+        psk="${psk:-$(random_psk)}"
+        snell_validate_psk "${major}" "${psk}" && break
+        psk=""
+    done
 
     backup_file "${MAIN_CONF}"
-    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
-    activate_and_verify "snell" "${port}" "Snell" || return 1
+    snell_set_config_key "${MAIN_CONF}" psk "${psk}" || return 1
+
+    if ! activate_and_verify "snell" "${port}" "Snell"; then
+        snell_restore_backup "${MAIN_CONF}"
+        return 1
+    fi
     show_config
     snell_verify_client_match || true
 }
