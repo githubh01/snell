@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,30 +28,49 @@ SERVICE_FILE="/etc/systemd/system/snell.service"
 SERVICE_USER="snell"
 SERVICE_GROUP="snell"
 
+# Legacy Snell paths kept only for migration detection.
+SNELL_LEGACY_CONF="${SNELL_DIR}/snell-server.conf"
+
 ANYTLS_DIR="/etc/AnyTLS"
 ANYTLS_BIN="${ANYTLS_DIR}/anytls-server"
 ANYTLS_CONFIG="${ANYTLS_DIR}/config.yaml"
+ANYTLS_JSON="${ANYTLS_DIR}/config.json"
+ANYTLS_PARAMS_FILE="${ANYTLS_DIR}/params.conf"
 ANYTLS_CLIENT_FILE="${ANYTLS_DIR}/anytls.txt"
 ANYTLS_SERVICE_NAME="anytls.service"
 ANYTLS_SERVICE_FILE="/etc/systemd/system/${ANYTLS_SERVICE_NAME}"
-ANYTLS_TZ="Asia/Shanghai"
 ANYTLS_ALIAS="AnyTLS"
-ANYTLS_DOWNLOADED_VERSION=""
 ANYTLS_CERT_DIR="${ANYTLS_DIR}/certs"
+ANYTLS_SELF_CERT="${ANYTLS_CERT_DIR}/self-signed.cert.pem"
+ANYTLS_SELF_KEY="${ANYTLS_CERT_DIR}/self-signed.key.pem"
+ANYTLS_SELF_CN="www.bing.com"
 ANYTLS_SING_BOX_BIN="${ANYTLS_DIR}/sing-box"
-ANYTLS_SING_BOX_CONFIG="${ANYTLS_DIR}/sing-box-anytls.json"
 ANYTLS_DOMAIN_FILE="${ANYTLS_DIR}/domain"
+# Legacy AnyTLS paths kept only for migration detection.
+ANYTLS_LEGACY_SING_BOX_CONFIG="${ANYTLS_DIR}/sing-box-anytls.json"
 CF_CERTBOT_CREDENTIALS="/etc/letsencrypt/cloudflare.ini"
 SING_BOX_DOWNLOADED_VERSION=""
 
 VLESS_DIR="/etc/vless-reality"
 VLESS_SING_BOX_BIN="${VLESS_DIR}/sing-box"
 VLESS_CONFIG="${VLESS_DIR}/config.json"
+# Only the Reality public key is stored outside the JSON: it cannot be
+# recomputed from the config, which holds the private key alone.
+VLESS_PUBKEY_FILE="${VLESS_DIR}/public.key"
 VLESS_PARAMS_FILE="${VLESS_DIR}/params.conf"
 VLESS_CLIENT_FILE="${VLESS_DIR}/vless-reality.txt"
 VLESS_SERVICE_NAME="vless-reality.service"
 VLESS_SERVICE_FILE="/etc/systemd/system/${VLESS_SERVICE_NAME}"
 VLESS_ALIAS="VLESS-Reality"
+# Reality handshake targets. These are third-party TLS 1.3 sites used as a
+# masquerade front; they are never the operator's own domain and never need
+# DNS pointing at this server.
+VLESS_DEFAULT_SNI="www.microsoft.com"
+VLESS_SNI_CANDIDATES="www.microsoft.com
+www.bing.com
+addons.mozilla.org
+itunes.apple.com
+www.icloud.com"
 
 info() { echo -e "${CYAN}$*${RESET}"; }
 ok() { echo -e "${GREEN}$*${RESET}"; }
@@ -65,6 +84,233 @@ require_root() {
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Shared reliability helpers
+#
+# fail_step() is the single place that reports a failed installation step. It
+# always prints what failed, why, what to check, and the command that shows
+# the real log, then returns non-zero so the caller aborts its module instead
+# of continuing with a half-built install.
+# ---------------------------------------------------------------------------
+
+fail_step() {
+    local step="$1"
+    local cause="$2"
+    local hints="${3:-}"
+    local logcmd="${4:-}"
+
+    echo >&2
+    err "FAILED: ${step}"
+    err "Reason: ${cause}"
+    if [ -n "${hints}" ]; then
+        echo >&2
+        warn "Things to check:"
+        printf '%s\n' "${hints}" >&2
+    fi
+    if [ -n "${logcmd}" ]; then
+        echo >&2
+        warn "Show the full log with:"
+        printf '  %s\n' "${logcmd}" >&2
+    fi
+    echo >&2
+    return 1
+}
+
+require_systemd() {
+    if ! has_command systemctl; then
+        fail_step "systemd check" \
+            "systemctl was not found; this script manages services through systemd." \
+            "- Only systemd-based distributions are supported.
+- Containers without systemd (plain Docker, some LXC images) will not work."
+        return 1
+    fi
+    [ -d /run/systemd/system ] || warn "systemd does not look like PID 1; service management may fail."
+    return 0
+}
+
+require_cmds() {
+    local missing=()
+    local cmd
+
+    for cmd in "$@"; do
+        has_command "${cmd}" || missing+=("${cmd}")
+    done
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        fail_step "dependency check" \
+            "Required command(s) not available: ${missing[*]}" \
+            "- Install them with your package manager and run this option again." \
+            "which ${missing[0]}"
+        return 1
+    fi
+    return 0
+}
+
+# Common runtime preconditions shared by all three protocol modules.
+preflight_common() {
+    local label="$1"
+
+    require_root
+    require_systemd || return 1
+    ensure_core_packages || return 1
+    require_cmds curl tar unzip openssl || return 1
+
+    case "$(uname -s)" in
+        Linux) : ;;
+        *) fail_step "${label} OS check" "Only Linux is supported (found $(uname -s))." ; return 1 ;;
+    esac
+    return 0
+}
+
+backup_file() {
+    local path="$1"
+    local stamp
+    local dest
+
+    [ -f "${path}" ] || return 0
+    stamp="$(date +%Y%m%d%H%M%S)"
+    dest="${path}.bak.${stamp}"
+    if cp -a "${path}" "${dest}" 2>/dev/null; then
+        ok "Backed up ${path} -> ${dest}"
+        return 0
+    fi
+    warn "Could not back up ${path}"
+    return 0
+}
+
+service_is_active() {
+    systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+# Confirms something is actually bound to the port, so we never claim success
+# for a service that started and then died on its own listener.
+port_is_listening() {
+    local port="$1"
+    local tries="${2:-10}"
+    local i
+
+    for (( i=0; i<tries; i++ )); do
+        if has_command ss; then
+            ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$" && return 0
+        elif has_command netstat; then
+            netstat -tuln 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$" && return 0
+        else
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Starts/restarts a unit and proves it is really up: active + listening.
+# On failure it dumps the journal instead of printing a bare error.
+activate_and_verify() {
+    local unit="$1"
+    local port="$2"
+    local label="$3"
+
+    systemctl daemon-reload
+    systemctl enable "${unit}" >/dev/null 2>&1 || true
+
+    if ! systemctl restart "${unit}"; then
+        journalctl -u "${unit}" --no-pager -n 30 >&2 || true
+        fail_step "${label} service start" \
+            "systemctl restart ${unit} returned an error." \
+            "- The config file may be rejected by the server binary.
+- The listen port may already be taken by another process." \
+            "journalctl -u ${unit} -e --no-pager"
+        return 1
+    fi
+
+    sleep 1
+    if ! service_is_active "${unit}"; then
+        journalctl -u "${unit}" --no-pager -n 30 >&2 || true
+        fail_step "${label} service state" \
+            "${unit} is not active after start." \
+            "- Read the journal lines above for the real error." \
+            "journalctl -u ${unit} -e --no-pager"
+        return 1
+    fi
+
+    if [ -n "${port}" ] && ! port_is_listening "${port}"; then
+        journalctl -u "${unit}" --no-pager -n 30 >&2 || true
+        fail_step "${label} listener check" \
+            "${unit} is active but nothing is listening on port ${port}." \
+            "- The service may have bound a different port than configured.
+- A firewall or another process may be interfering." \
+            "journalctl -u ${unit} -e --no-pager"
+        return 1
+    fi
+
+    return 0
+}
+
+detect_public_ipv4() {
+    curl -fsSL --connect-timeout 5 -4 https://api.ipify.org 2>/dev/null || true
+}
+
+detect_public_ipv6() {
+    curl -fsSL --connect-timeout 5 -6 https://api6.ipify.org 2>/dev/null || true
+}
+
+# Address used when building a client share link: IPv4 if present, else the
+# IPv6 literal in brackets so the URL stays valid.
+client_endpoint_host() {
+    local v4
+    local v6
+
+    v4="$(detect_public_ipv4)"
+    if [ -n "${v4}" ]; then
+        printf '%s' "${v4}"
+        return 0
+    fi
+
+    v6="$(detect_public_ipv6)"
+    if [ -n "${v6}" ]; then
+        printf '[%s]' "${v6}"
+        return 0
+    fi
+
+    printf 'YOUR_SERVER_IP'
+}
+
+is_valid_domain() {
+    local domain="${1:-}"
+
+    [ -n "${domain}" ] || return 1
+    [ "${#domain}" -le 253 ] || return 1
+    [[ "${domain}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] || return 1
+    # Reject bare IP addresses: they are never valid here.
+    [[ "${domain}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 1
+    return 0
+}
+
+# Downloads to a temp path and refuses to return success on an empty or
+# truncated file, so callers never unpack a zero-byte "download".
+download_to() {
+    local url="$1"
+    local dest="$2"
+    local label="$3"
+
+    if ! curl -fL --proto '=https' --tlsv1.2 --connect-timeout 15 --retry 2 "${url}" -o "${dest}"; then
+        fail_step "${label} download" \
+            "curl could not fetch ${url}" \
+            "- Check outbound network and DNS on this server.
+- The upstream release URL may have changed." \
+            "curl -fL -o /dev/null '${url}'"
+        return 1
+    fi
+
+    if [ ! -s "${dest}" ]; then
+        fail_step "${label} download" \
+            "Downloaded file is empty: ${dest}" \
+            "- The URL may return an error page instead of a binary." \
+            "curl -sI '${url}'"
+        return 1
+    fi
+    return 0
 }
 
 install_menu_shortcut() {
@@ -272,8 +518,51 @@ install_packages() {
     fi
 }
 
-install_anytls_packages() {
+# Superset of install_packages: adds the tools every protocol module needs
+# (openssl for keys/certs, jq for reading generated JSON back, ca-certificates
+# for TLS downloads). Safe to call repeatedly.
+ensure_core_packages() {
+    local missing=()
+    local cmd
+
     install_packages
+
+    for cmd in openssl jq; do
+        has_command "${cmd}" || missing+=("${cmd}")
+    done
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warn "Installing additional dependencies: ${missing[*]}"
+        if has_command apt-get; then
+            run_apt_get install -y openssl jq ca-certificates
+        elif has_command dnf; then
+            dnf install -y openssl jq ca-certificates
+        elif has_command yum; then
+            yum install -y openssl jq ca-certificates
+        elif has_command apk; then
+            apk add --no-cache openssl jq ca-certificates
+        else
+            fail_step "dependency install" \
+                "No supported package manager found to install: ${missing[*]}" \
+                "- Install ${missing[*]} manually, then run this option again."
+            return 1
+        fi
+    fi
+
+    for cmd in openssl jq; do
+        if ! has_command "${cmd}"; then
+            fail_step "dependency install" \
+                "${cmd} is still unavailable after the install attempt." \
+                "- Install ${cmd} manually and run this option again." \
+                "command -v ${cmd}"
+            return 1
+        fi
+    done
+    return 0
+}
+
+install_anytls_packages() {
+    ensure_core_packages || return 1
 
     if has_command apt-get; then
         run_apt_get install -y ca-certificates
@@ -358,58 +647,99 @@ detect_arch() {
         i386|i686) echo "i386" ;;
         aarch64|arm64) echo "aarch64" ;;
         armv7l|armv7) echo "armv7l" ;;
-        *) die "Unsupported CPU architecture: $(uname -m)" ;;
+        *)
+            fail_step "architecture check" \
+                "Snell builds are not published for $(uname -m)." \
+                "- Supported: x86_64/amd64, i386/i686, aarch64/arm64, armv7l."
+            return 1
+            ;;
     esac
 }
 
+# ===========================================================================
+# Snell
+#
+# Version resolution, architecture mapping and the Surge output format follow
+# the upstream jinqians/snell.sh behaviour. In particular the Surge "version"
+# parameter is derived from the version actually installed on this box, not
+# from the menu choice: a v5 server speaks v4 and v5, never v6.
+# ===========================================================================
+
 choose_snell_major() {
-    echo >&2
-    info "Choose Snell major version:" >&2
-    echo "1. Snell v4" >&2
-    echo "2. Snell v5" >&2
-    echo "3. Snell v6 Beta" >&2
+    local choice
+
+    {
+        echo
+        info "Choose Snell major version:"
+        echo "1. Snell v4"
+        echo "2. Snell v5"
+        echo "3. Snell v6 Beta"
+    } >&2
 
     while true; do
         read -rp "Select [1-3]: " choice
         case "${choice}" in
-            1) echo "v4"; return 0 ;;
-            2) echo "v5"; return 0 ;;
-            3) echo "v6"; return 0 ;;
+            1) printf 'v4'; return 0 ;;
+            2) printf 'v5'; return 0 ;;
+            3) printf 'v6'; return 0 ;;
             *) err "Please enter 1, 2, or 3." ;;
         esac
     done
 }
 
-latest_from_official_docs() {
-    local major="$1"
-    local fallback="$2"
+# Scrapes the two official Surge pages for the newest published build of one
+# major line. Returns empty on failure so the caller can apply a fallback.
+snell_scrape_version() {
+    local pattern="$1"
+    local html
     local version=""
-    local html=""
+    local url
 
-    html="$(curl -fsSL --connect-timeout 10 https://manual.nssurge.com/others/snell.html 2>/dev/null || true)"
-    if [ -z "${html}" ]; then
-        html="$(curl -fsSL --connect-timeout 10 https://kb.nssurge.com/surge-knowledge-base/release-notes/snell 2>/dev/null || true)"
-    fi
+    for url in \
+        "https://manual.nssurge.com/others/snell.html" \
+        "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" \
+        "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell"
+    do
+        html="$(curl -fsSL --connect-timeout 10 "${url}" 2>/dev/null || true)"
+        [ -n "${html}" ] || continue
+        version="$(printf '%s\n' "${html}" | grep -Eo "${pattern}" | head -n1 || true)"
+        [ -n "${version}" ] && break
+    done
 
-    if [ -n "${html}" ]; then
-        version="$(printf '%s\n' "${html}" | grep -Eo "snell-server-v${major}\.[0-9]+\.[0-9]+[a-z0-9]*" | sed 's/snell-server-//' | head -n 1 || true)"
-    fi
+    printf '%s' "${version}"
+}
 
-    if [ -n "${version}" ]; then
-        echo "${version}"
-    else
-        echo "${fallback}"
+snell_latest_v4() {
+    local v
+    v="$(snell_scrape_version 'snell-server-v4\.[0-9]+\.[0-9]+' | sed 's/snell-server-//')"
+    printf '%s' "${v:-v4.1.1}"
+}
+
+# v5 publishes betas ahead of stable; prefer a beta when one is newer, which
+# matches the upstream script's behaviour.
+snell_latest_v5() {
+    local beta stable
+    beta="$(snell_scrape_version 'snell-server-v5\.[0-9]+\.[0-9]+b[0-9]+' | sed 's/snell-server-//')"
+    if [ -n "${beta}" ]; then
+        printf '%s' "${beta}"
+        return 0
     fi
+    stable="$(snell_scrape_version 'snell-server-v5\.[0-9]+\.[0-9]+' | sed 's/snell-server-//')"
+    printf '%s' "${stable:-v5.0.0}"
+}
+
+snell_latest_v6() {
+    local v
+    v="$(snell_scrape_version 'snell-server-v6\.[0-9]+\.[0-9]+[a-z0-9]*' | sed 's/snell-server-//')"
+    printf '%s' "${v:-v6.0.0b4}"
 }
 
 resolve_snell_version() {
-    local selected="$1"
-
-    case "${selected}" in
-        v4) latest_from_official_docs 4 "v4.1.1" ;;
-        v5) latest_from_official_docs 5 "v5.0.1" ;;
-        v6) latest_from_official_docs 6 "v6.0.0b4" ;;
-        *) die "Unknown Snell version selection: ${selected}" ;;
+    case "$1" in
+        v4) snell_latest_v4 ;;
+        v5) snell_latest_v5 ;;
+        v6) snell_latest_v6 ;;
+        *) fail_step "Snell version resolution" "Unknown Snell major: $1"; return 1 ;;
     esac
 }
 
@@ -419,10 +749,12 @@ download_url() {
     local major="${version%%.*}"
 
     if [ "${major}" = "v6" ] && [ "${arch}" = "armv7l" ]; then
-        die "Snell v6 does not support armv7l."
+        fail_step "Snell download" "Snell v6 does not publish an armv7l build." \
+            "- Choose Snell v4 or v5 on this architecture."
+        return 1
     fi
 
-    echo "https://dl.nssurge.com/snell/snell-server-${version}-linux-${arch}.zip"
+    printf 'https://dl.nssurge.com/snell/snell-server-%s-linux-%s.zip' "${version}" "${arch}"
 }
 
 random_psk() {
@@ -449,20 +781,22 @@ prompt_port() {
         read -rp "${prompt}" port
         if [ -z "${port}" ] && [ "${default_port}" = "random" ]; then
             port="$(random_available_port)"
+            echo "Using random port: ${port}" >&2
         fi
         port="${port:-${default_port}}"
-        if [[ "${port}" =~ ^[0-9]+$ ]] && [ "${port}" -ge 1 ] && [ "${port}" -le 65535 ]; then
-            echo "${port}"
-            return 0
+        if ! valid_port "${port}"; then
+            err "Port must be a number between 1 and 65535."
+            continue
         fi
-        err "Port must be a number between 1 and 65535."
+        printf '%s' "${port}"
+        return 0
     done
 }
 
 prompt_dns() {
     local dns
     read -rp "DNS servers [default 1.1.1.1,8.8.8.8]: " dns
-    echo "${dns:-1.1.1.1,8.8.8.8}"
+    printf '%s' "${dns:-1.1.1.1,8.8.8.8}"
 }
 
 write_config() {
@@ -486,7 +820,7 @@ EOF
 write_service() {
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=Snell Proxy Service
+Description=Snell Proxy Service (Main)
 After=network-online.target
 Wants=network-online.target
 
@@ -504,134 +838,164 @@ ProtectHome=true
 ReadWritePaths=${SNELL_DIR}
 Restart=on-failure
 RestartSec=2s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snell-server
 
 [Install]
 WantedBy=multi-user.target
 EOF
 }
 
+# Downloads and installs snell-server, proving at each step that the artifact
+# is real: non-empty zip, successful unzip, binary present, executable, and
+# able to report its own version.
 install_binary() {
     local selected="$1"
     local version
     local arch
     local url
     local tmpdir
+    local rc=0
 
-    arch="$(detect_arch)"
-    version="$(resolve_snell_version "${selected}")"
-    url="$(download_url "${version}" "${arch}")"
+    if ! arch="$(detect_arch)"; then
+        return 1
+    fi
+    if ! version="$(resolve_snell_version "${selected}")"; then
+        return 1
+    fi
+    if ! url="$(download_url "${version}" "${arch}")"; then
+        return 1
+    fi
+
     tmpdir="$(mktemp -d)"
 
     info "Downloading Snell ${version} (${arch})..."
     warn "Source: ${url}"
 
-    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/snell.zip"
-    unzip -o "${tmpdir}/snell.zip" -d "${tmpdir}" >/dev/null
+    if ! download_to "${url}" "${tmpdir}/snell.zip" "Snell"; then
+        rm -rf "${tmpdir}"
+        return 1
+    fi
+
+    if ! unzip -o "${tmpdir}/snell.zip" -d "${tmpdir}" >/dev/null 2>&1; then
+        rm -rf "${tmpdir}"
+        fail_step "Snell extract" "Could not unzip the downloaded archive." \
+            "- The download may be corrupt or the version may not exist for ${arch}.
+- Verify the URL is valid: ${url}"
+        return 1
+    fi
 
     if [ ! -f "${tmpdir}/snell-server" ]; then
         rm -rf "${tmpdir}"
-        die "snell-server was not found in the downloaded archive."
+        fail_step "Snell extract" "snell-server was not found inside the archive." \
+            "- The upstream archive layout may have changed."
+        return 1
     fi
 
-    install -m 0755 "${tmpdir}/snell-server" "${SNELL_BIN}"
+    install -m 0755 "${tmpdir}/snell-server" "${SNELL_BIN}" || rc=1
     rm -rf "${tmpdir}"
-    ok "Installed: ${SNELL_BIN}"
-}
 
-install_snell() {
-    local selected
-    local port
-    local dns
-    local psk
-    local overwrite
-
-    require_root
-    install_packages
-    ensure_dirs
-
-    selected="$(choose_snell_major)"
-    install_binary "${selected}"
-
-    if [ -f "${MAIN_CONF}" ]; then
-        warn "Existing main config detected: ${MAIN_CONF}"
-        read -rp "Overwrite main config? [y/N]: " overwrite
-        if [[ ! "${overwrite}" =~ ^[Yy]$ ]]; then
-            write_service
-            systemctl daemon-reload
-            systemctl enable --now snell
-            ok "Service started with the existing config."
-            show_config
-            return 0
-        fi
+    if [ "${rc}" -ne 0 ] || [ ! -x "${SNELL_BIN}" ]; then
+        fail_step "Snell install" "Could not install snell-server to ${SNELL_BIN}" \
+            "- Check that ${INSTALL_DIR} is writable and the disk has space." \
+            "df -h ${INSTALL_DIR}"
+        return 1
     fi
 
-    port="$(prompt_port random)"
-    dns="$(prompt_dns)"
-    psk="$(random_psk)"
-    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
-    write_service
-
-    systemctl daemon-reload
-    systemctl enable --now snell
-
-    ok "Snell installation completed."
-    show_config
-}
-
-uninstall_snell() {
-    local confirm
-    local remove_conf
-
-    require_root
-    warn "This will stop and uninstall Snell. Config files can be kept."
-    read -rp "Confirm uninstall? [y/N]: " confirm
-    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
-
-    systemctl disable --now snell 2>/dev/null || true
-    rm -f "${SERVICE_FILE}" "${SNELL_BIN}"
-    systemctl daemon-reload 2>/dev/null || true
-
-    read -rp "Remove config directory ${SNELL_DIR}? [y/N]: " remove_conf
-    if [[ "${remove_conf}" =~ ^[Yy]$ ]]; then
-        rm -rf "${SNELL_DIR}"
+    if ! "${SNELL_BIN}" --v >/dev/null 2>&1; then
+        fail_step "Snell verify" \
+            "${SNELL_BIN} was installed but does not run (wrong architecture or missing libc)." \
+            "- Confirm the server architecture matches: $(uname -m)" \
+            "${SNELL_BIN} --v"
+        return 1
     fi
 
-    ok "Uninstall completed."
+    ok "Installed and verified: ${SNELL_BIN} ($("${SNELL_BIN}" --v 2>&1 | head -n1))"
+    return 0
 }
 
-restart_snell() {
-    require_root
+# Moves a pre-existing /etc/snell/snell-server.conf into the users/ layout
+# this script uses, without discarding the original.
+migrate_legacy_snell_config() {
+    [ -f "${MAIN_CONF}" ] && return 0
+    [ -f "${SNELL_LEGACY_CONF}" ] || return 0
 
-    [ -f "${SERVICE_FILE}" ] || die "Service file not found. Please install Snell first."
-
-    systemctl daemon-reload
-    systemctl restart snell
-    systemctl --no-pager --full status snell || true
+    info "Found a legacy config at ${SNELL_LEGACY_CONF}; migrating it."
+    mkdir -p "${USERS_DIR}"
+    cp -a "${SNELL_LEGACY_CONF}" "${MAIN_CONF}"
+    chmod 640 "${MAIN_CONF}"
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${MAIN_CONF}" 2>/dev/null || true
+    ok "Migrated ${SNELL_LEGACY_CONF} -> ${MAIN_CONF} (the original was kept)."
+    return 0
 }
 
-update_snell() {
-    local selected
-
-    require_root
-    install_packages
-
-    selected="$(choose_snell_major)"
-    install_binary "${selected}"
-    systemctl restart snell 2>/dev/null || true
-    ok "Snell binary update completed."
+snell_config_is_valid() {
+    [ -s "${MAIN_CONF}" ] || return 1
+    grep -Eq '^[[:space:]]*listen[[:space:]]*=' "${MAIN_CONF}" || return 1
+    grep -Eq '^[[:space:]]*psk[[:space:]]*=' "${MAIN_CONF}" || return 1
+    return 0
 }
 
+snell_is_installed() {
+    [ -x "${SNELL_BIN}" ] || [ -f "${SERVICE_FILE}" ] || [ -s "${MAIN_CONF}" ]
+}
+
+snell_state() {
+    migrate_legacy_snell_config >/dev/null 2>&1 || true
+
+    if ! snell_is_installed; then
+        echo "not_installed"
+        return 0
+    fi
+    if ! snell_config_is_valid; then
+        echo "config_broken"
+        return 0
+    fi
+    if [ ! -x "${SNELL_BIN}" ]; then
+        echo "binary_missing"
+        return 0
+    fi
+    if [ ! -f "${SERVICE_FILE}" ]; then
+        echo "service_missing"
+        return 0
+    fi
+    echo "ok"
+}
+
+# Returns everything after the first '=' so values that themselves contain
+# '=' survive intact. A base64 PSK ending in '=' or '==' was previously
+# truncated here, which silently produced an unusable Surge line.
 extract_value() {
     local key="$1"
     local file="$2"
 
-    grep -E "^[[:space:]]*${key}[[:space:]]*=" "${file}" | head -n 1 | awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}'
+    [ -f "${file}" ] || return 0
+    sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.*)$/\1/p" "${file}" \
+        | head -n1 \
+        | sed -E 's/[[:space:]]+$//'
 }
 
 detect_public_ip() {
-    curl -fsSL --connect-timeout 5 https://api.ipify.org 2>/dev/null || true
+    client_endpoint_host
 }
 
+snell_main_port() {
+    [ -f "${MAIN_CONF}" ] || return 0
+    extract_value listen "${MAIN_CONF}" | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
+}
+
+snell_main_psk() {
+    [ -f "${MAIN_CONF}" ] || return 0
+    extract_value psk "${MAIN_CONF}"
+}
+
+snell_main_dns() {
+    [ -f "${MAIN_CONF}" ] || return 0
+    extract_value dns "${MAIN_CONF}"
+}
+
+# Reads the major version from the binary that is actually installed.
 snell_installed_major() {
     local output
 
@@ -640,34 +1004,41 @@ snell_installed_major() {
     elif has_command snell-server; then
         output="$(snell-server --v 2>&1 || true)"
     else
-        output=""
+        echo "unknown"
+        return 0
     fi
 
-    if echo "${output}" | grep -qi 'v6'; then
+    if echo "${output}" | grep -qi 'v\?6\.'; then
         echo "v6"
-    elif echo "${output}" | grep -qi 'v5'; then
+    elif echo "${output}" | grep -qi 'v\?5\.'; then
         echo "v5"
-    elif echo "${output}" | grep -qi 'v4'; then
+    elif echo "${output}" | grep -qi 'v\?4\.'; then
         echo "v4"
     else
         echo "unknown"
     fi
 }
 
+# Maps the INSTALLED server major to the Surge client "version" values it can
+# actually serve. A v5 server accepts v4 and v5 clients; it does not speak v6.
+snell_surge_versions() {
+    case "$1" in
+        v6) echo "6" ;;
+        v5) echo "4 5" ;;
+        v4) echo "4" ;;
+        *)  echo "4" ;;
+    esac
+}
+
 print_one_config() {
     local file="$1"
     local label="$2"
-    local port
-    local psk
-    local dns
-    local ip
-    local major
+    local port psk dns ip major v
 
     port="$(extract_value listen "${file}" | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p')"
     psk="$(extract_value psk "${file}")"
     dns="$(extract_value dns "${file}")"
     ip="$(detect_public_ip)"
-    ip="${ip:-YOUR_SERVER_IP}"
     major="$(snell_installed_major)"
 
     echo
@@ -676,25 +1047,16 @@ print_one_config() {
     echo "Port: ${port}"
     echo "PSK: ${psk}"
     echo "DNS: ${dns}"
-    echo "Detected Snell server: ${major}"
-    echo "Surge examples:"
-    case "${major}" in
-        v4)
-            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 4, reuse = true, tfo = true"
-            ;;
-        v5)
-            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true, tfo = true"
-            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 6, reuse = true, tfo = true"
-            ;;
-        v6)
-            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 6, reuse = true, tfo = true"
-            ;;
-        *)
-            warn "Could not detect Snell server major version. Showing v5 and v6 examples by default."
-            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true, tfo = true"
-            echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = 6, reuse = true, tfo = true"
-            ;;
-    esac
+    echo "Installed Snell server: ${major}"
+
+    if [ "${major}" = "unknown" ]; then
+        warn "Could not detect the installed Snell version; showing the v4 line only."
+    fi
+
+    echo "Surge configuration line(s):"
+    for v in $(snell_surge_versions "${major}"); do
+        echo "Snell = snell, ${ip}, ${port}, psk = ${psk}, version = ${v}, reuse = true, tfo = true"
+    done
 }
 
 show_config() {
@@ -716,8 +1078,241 @@ show_config() {
     done
 }
 
+# Confirms the Surge line that was printed carries the port and PSK the
+# server is really configured with.
+snell_verify_client_match() {
+    local port psk
+
+    port="$(snell_main_port)"
+    psk="$(snell_main_psk)"
+
+    if [ -z "${port}" ] || [ -z "${psk}" ]; then
+        warn "Could not read port/PSK back from ${MAIN_CONF}."
+        return 1
+    fi
+    ok "Client output matches the server config (port ${port}, PSK from ${MAIN_CONF})."
+    return 0
+}
+
+# Non-destructive decision point when a config already exists.
+snell_existing_config_choice() {
+    local choice
+
+    echo
+    warn "An existing Snell config was found: ${MAIN_CONF}"
+    echo "1. Keep the current config and continue (recommended)"
+    echo "2. Back it up, then generate a new port/PSK"
+    echo "3. Show the current config, then decide"
+    echo "0. Cancel"
+    read -rp "Select [0-3]: " choice
+
+    case "${choice}" in
+        1) echo "keep" ;;
+        2) echo "regenerate" ;;
+        3) echo "show" ;;
+        *) echo "cancel" ;;
+    esac
+}
+
+install_snell() {
+    local selected port dns psk decision state
+
+    preflight_common "Snell" || return 1
+    ensure_dirs
+    migrate_legacy_snell_config
+
+    state="$(snell_state)"
+    if [ "${state}" != "not_installed" ]; then
+        info "Snell is already present (state: ${state})."
+    fi
+
+    if ! selected="$(choose_snell_major)"; then
+        return 1
+    fi
+    install_binary "${selected}" || return 1
+
+    if snell_config_is_valid; then
+        while true; do
+            decision="$(snell_existing_config_choice)"
+            case "${decision}" in
+                show) show_config ;;
+                keep|regenerate|cancel) break ;;
+            esac
+        done
+
+        case "${decision}" in
+            cancel)
+                info "Cancelled. The binary was updated; the config was left untouched."
+                return 0
+                ;;
+            keep)
+                write_service
+                if activate_and_verify "snell" "$(snell_main_port)" "Snell"; then
+                    ok "Snell is running with the existing config."
+                    show_config
+                    snell_verify_client_match || true
+                    return 0
+                fi
+                return 1
+                ;;
+            regenerate)
+                backup_file "${MAIN_CONF}"
+                ;;
+        esac
+    fi
+
+    port="$(prompt_port random)"
+    dns="$(prompt_dns)"
+    psk="$(random_psk)"
+    write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
+    write_service
+
+    activate_and_verify "snell" "${port}" "Snell" || return 1
+
+    ok "Snell installation completed."
+    show_config
+    snell_verify_client_match || true
+    return 0
+}
+
+# Upgrades only the binary. Port, PSK, DNS and ipv6 settings are never
+# touched here.
+update_snell() {
+    local selected port
+
+    preflight_common "Snell" || return 1
+    migrate_legacy_snell_config
+
+    if ! snell_is_installed; then
+        fail_step "Snell update" "Snell is not installed." "- Use 'Install / reinstall' first."
+        return 1
+    fi
+
+    info "Current installed version: $(snell_installed_major)"
+    info "This updates the binary only; port, PSK and DNS are preserved."
+
+    if ! selected="$(choose_snell_major)"; then
+        return 1
+    fi
+    install_binary "${selected}" || return 1
+
+    if ! snell_config_is_valid; then
+        warn "The existing config is missing or incomplete; not starting the service."
+        warn "Run 'Install / reinstall' to create a config."
+        return 1
+    fi
+
+    write_service
+    port="$(snell_main_port)"
+    activate_and_verify "snell" "${port}" "Snell" || return 1
+
+    ok "Snell binary update completed; the existing config was preserved."
+    show_config
+    snell_verify_client_match || true
+    return 0
+}
+
+# Rebuilds the unit and restarts without changing any user-visible value.
+snell_repair() {
+    local port
+
+    preflight_common "Snell" || return 1
+    migrate_legacy_snell_config
+
+    if [ ! -x "${SNELL_BIN}" ]; then
+        fail_step "Snell repair" "The snell-server binary is missing." \
+            "- Use 'Install / reinstall' or 'Update binary' to fetch it."
+        return 1
+    fi
+    if ! snell_config_is_valid; then
+        fail_step "Snell repair" "The main config is missing or incomplete: ${MAIN_CONF}" \
+            "- Use 'Install / reinstall' to create a new config."
+        return 1
+    fi
+
+    ensure_dirs
+    write_service
+    port="$(snell_main_port)"
+    activate_and_verify "snell" "${port}" "Snell" || return 1
+
+    ok "Snell service repaired; settings unchanged."
+    show_config
+    return 0
+}
+
+uninstall_snell() {
+    local confirm remove_conf
+
+    require_root
+    if ! snell_is_installed; then
+        warn "Snell is not installed."
+        return 0
+    fi
+
+    warn "This removes only files created by this module:"
+    echo "  ${SNELL_BIN}"
+    echo "  ${SERVICE_FILE}"
+    echo "  ${SNELL_DIR} (optional)"
+    read -rp "Confirm uninstall? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+
+    systemctl disable --now snell 2>/dev/null || true
+    rm -f "${SERVICE_FILE}" "${SNELL_BIN}"
+    systemctl daemon-reload 2>/dev/null || true
+
+    read -rp "Also remove the config directory ${SNELL_DIR}? [y/N]: " remove_conf
+    if [[ "${remove_conf}" =~ ^[Yy]$ ]]; then
+        rm -rf "${SNELL_DIR}"
+    else
+        info "Config kept at ${SNELL_DIR}"
+    fi
+
+    ok "Snell uninstalled. VLESS+Reality and AnyTLS were not touched."
+}
+
+restart_snell() {
+    require_root
+
+    if [ ! -f "${SERVICE_FILE}" ]; then
+        fail_step "Snell restart" "Service file not found: ${SERVICE_FILE}" \
+            "- Install Snell first."
+        return 1
+    fi
+
+    activate_and_verify "snell" "$(snell_main_port)" "Snell" || return 1
+    ok "Snell restarted."
+}
+
 service_status() {
-    systemctl --no-pager --full status snell || true
+    local port
+
+    if ! snell_is_installed; then
+        warn "Snell is not installed."
+        return 0
+    fi
+
+    echo
+    ok "Snell"
+    echo "State: $(snell_state)"
+    echo "Installed version: $(snell_installed_major)"
+    echo "Port: $(snell_main_port)"
+
+    if service_is_active snell; then
+        echo "Service: running"
+    else
+        echo "Service: stopped"
+    fi
+
+    port="$(snell_main_port)"
+    if [ -n "${port}" ]; then
+        if port_is_listening "${port}" 1; then
+            echo "Listener: port ${port} is listening"
+        else
+            warn "Listener: nothing is listening on port ${port}"
+        fi
+    fi
+
+    systemctl --no-pager --full status snell 2>/dev/null | sed -n '1,8p' || true
 }
 
 start_snell() {
@@ -736,46 +1331,39 @@ snell_logs() {
     journalctl -u snell --no-pager -n 80 || true
 }
 
-snell_main_port() {
-    [ -f "${MAIN_CONF}" ] || return 0
-    extract_value listen "${MAIN_CONF}" | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
-}
-
-snell_main_psk() {
-    [ -f "${MAIN_CONF}" ] || return 0
-    extract_value psk "${MAIN_CONF}"
-}
-
-snell_main_dns() {
-    [ -f "${MAIN_CONF}" ] || return 0
-    extract_value dns "${MAIN_CONF}"
-}
-
 change_snell_port() {
-    local port
-    local psk
-    local dns
+    local port psk dns
 
-    require_root
-    [ -f "${MAIN_CONF}" ] || die "Main Snell config not found. Please install Snell first."
+    preflight_common "Snell" || return 1
+
+    if ! snell_config_is_valid; then
+        fail_step "Snell change port" "Main config not found or incomplete: ${MAIN_CONF}" \
+            "- Install Snell first."
+        return 1
+    fi
 
     port="$(prompt_port "$(snell_main_port)")"
     psk="$(snell_main_psk)"
     dns="$(snell_main_dns)"
     dns="${dns:-1.1.1.1,8.8.8.8}"
 
+    backup_file "${MAIN_CONF}"
     write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
-    systemctl restart snell 2>/dev/null || true
+    activate_and_verify "snell" "${port}" "Snell" || return 1
     show_config
+    snell_verify_client_match || true
 }
 
 change_snell_psk() {
-    local port
-    local psk
-    local dns
+    local port psk dns
 
-    require_root
-    [ -f "${MAIN_CONF}" ] || die "Main Snell config not found. Please install Snell first."
+    preflight_common "Snell" || return 1
+
+    if ! snell_config_is_valid; then
+        fail_step "Snell change PSK" "Main config not found or incomplete: ${MAIN_CONF}" \
+            "- Install Snell first."
+        return 1
+    fi
 
     port="$(snell_main_port)"
     dns="$(snell_main_dns)"
@@ -783,9 +1371,11 @@ change_snell_psk() {
     read -rp "New PSK [press Enter to generate]: " psk
     psk="${psk:-$(random_psk)}"
 
+    backup_file "${MAIN_CONF}"
     write_config "${MAIN_CONF}" "${port}" "${psk}" "${dns}"
-    systemctl restart snell 2>/dev/null || true
+    activate_and_verify "snell" "${port}" "Snell" || return 1
     show_config
+    snell_verify_client_match || true
 }
 
 snell_menu() {
@@ -797,33 +1387,35 @@ snell_menu() {
         echo -e "${CYAN}        Snell Manager${RESET}"
         echo -e "${CYAN}============================================${RESET}"
         echo "1. Install / reinstall Snell"
-        echo "2. Update Snell binary"
+        echo "2. Update Snell binary (keeps port and PSK)"
         echo "3. Show config"
         echo "4. Change main port"
         echo "5. Change main PSK"
-        echo "6. Restart service"
-        echo "7. Start service"
-        echo "8. Stop service"
-        echo "9. Show service status"
-        echo "10. Show logs"
-        echo "11. User config management"
-        echo "12. Uninstall Snell"
+        echo "6. Repair service (rebuild unit, keep settings)"
+        echo "7. Restart service"
+        echo "8. Start service"
+        echo "9. Stop service"
+        echo "10. Show service status"
+        echo "11. Show logs"
+        echo "12. User config management"
+        echo "13. Uninstall Snell"
         echo "0. Back"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-12]: " choice
+        read -rp "Select [0-13]: " choice
         case "${choice}" in
-            1) install_snell ;;
-            2) update_snell ;;
+            1) install_snell || true ;;
+            2) update_snell || true ;;
             3) show_config ;;
-            4) change_snell_port ;;
-            5) change_snell_psk ;;
-            6) restart_snell ;;
-            7) start_snell ;;
-            8) stop_snell ;;
-            9) service_status ;;
-            10) snell_logs ;;
-            11) user_menu ;;
-            12) uninstall_snell ;;
+            4) change_snell_port || true ;;
+            5) change_snell_psk || true ;;
+            6) snell_repair || true ;;
+            7) restart_snell || true ;;
+            8) start_snell ;;
+            9) stop_snell ;;
+            10) service_status ;;
+            11) snell_logs ;;
+            12) user_menu ;;
+            13) uninstall_snell ;;
             0) return 0 ;;
             *) err "Invalid option." ;;
         esac
@@ -911,20 +1503,18 @@ enable_bbr() {
     fi
 }
 
-anytls_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *) die "AnyTLS supports only amd64 and arm64 on this script. Current architecture: $(uname -m)" ;;
-    esac
-}
 
 sing_box_arch() {
     case "$(uname -m)" in
         x86_64|amd64) echo "amd64" ;;
         aarch64|arm64) echo "arm64" ;;
         armv7l|armv7) echo "armv7" ;;
-        *) die "sing-box architecture is unsupported by this script: $(uname -m)" ;;
+        *)
+            fail_step "architecture check" \
+                "sing-box builds are not published for $(uname -m) by this script." \
+                "- Supported: x86_64/amd64, aarch64/arm64, armv7l."
+            return 1
+            ;;
     esac
 }
 
@@ -932,10 +1522,12 @@ sing_box_latest_version() {
     local version
 
     version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-    [ -n "${version}" ] || die "Could not get latest sing-box version from GitHub."
-    echo "${version}"
+    [ -n "${version}" ] || return 1
+    printf '%s' "${version}"
 }
 
+# Downloads sing-box to an explicit destination and proves the result is a
+# working binary before returning. Callers must check the return value.
 install_sing_box_binary() {
     local dest="$1"
     local version
@@ -944,15 +1536,30 @@ install_sing_box_binary() {
     local url
     local name
     local tmpdir
+    local rc=0
 
-    [ -n "${dest}" ] || die "install_sing_box_binary: destination path is required."
+    if [ -z "${dest}" ]; then
+        fail_step "sing-box install" "Internal error: destination path is required."
+        return 1
+    fi
 
-    install_anytls_packages
+    install_anytls_packages || return 1
     mkdir -p "$(dirname "${dest}")"
 
-    version="$(sing_box_latest_version)"
+    if ! version="$(sing_box_latest_version)"; then
+        fail_step "sing-box version lookup" \
+            "Could not read the latest release tag from api.github.com." \
+            "- The server may not reach api.github.com (DNS, firewall, or rate limit).
+- Try again in a few minutes if you hit the GitHub API rate limit." \
+            "curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+        return 1
+    fi
+
+    if ! arch="$(sing_box_arch)"; then
+        return 1
+    fi
+
     version_num="${version#v}"
-    arch="$(sing_box_arch)"
     name="sing-box-${version_num}-linux-${arch}"
     url="https://github.com/SagerNet/sing-box/releases/download/${version}/${name}.tar.gz"
     tmpdir="$(mktemp -d)"
@@ -960,17 +1567,71 @@ install_sing_box_binary() {
     info "Downloading sing-box ${version} (${arch})..."
     warn "Source: ${url}"
 
-    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/sing-box.tar.gz"
-    tar xzf "${tmpdir}/sing-box.tar.gz" -C "${tmpdir}"
-
-    [ -f "${tmpdir}/${name}/sing-box" ] || {
+    if ! download_to "${url}" "${tmpdir}/sing-box.tar.gz" "sing-box"; then
         rm -rf "${tmpdir}"
-        die "sing-box binary was not found in the downloaded archive."
-    }
+        return 1
+    fi
 
-    install -m 0755 "${tmpdir}/${name}/sing-box" "${dest}"
+    if ! tar xzf "${tmpdir}/sing-box.tar.gz" -C "${tmpdir}" 2>/dev/null; then
+        rm -rf "${tmpdir}"
+        fail_step "sing-box extract" \
+            "Could not extract ${name}.tar.gz" \
+            "- The download may be corrupt; run the option again."
+        return 1
+    fi
+
+    if [ ! -f "${tmpdir}/${name}/sing-box" ]; then
+        rm -rf "${tmpdir}"
+        fail_step "sing-box extract" \
+            "sing-box was not found inside the archive (expected ${name}/sing-box)." \
+            "- The upstream archive layout may have changed."
+        return 1
+    fi
+
+    install -m 0755 "${tmpdir}/${name}/sing-box" "${dest}" || rc=1
     rm -rf "${tmpdir}"
+
+    if [ "${rc}" -ne 0 ] || [ ! -x "${dest}" ]; then
+        fail_step "sing-box install" "Could not install the binary to ${dest}" \
+            "- Check that the filesystem is writable and has free space." \
+            "df -h $(dirname "${dest}")"
+        return 1
+    fi
+
+    if ! "${dest}" version >/dev/null 2>&1; then
+        fail_step "sing-box verify" \
+            "${dest} was installed but does not run (wrong architecture or missing libc)." \
+            "- Confirm the server architecture matches: $(uname -m)" \
+            "${dest} version"
+        return 1
+    fi
+
     SING_BOX_DOWNLOADED_VERSION="${version}"
+    ok "sing-box ${version} verified at ${dest}"
+    return 0
+}
+
+# Validates a sing-box JSON config with the binary's own checker. This is the
+# gate that prevents "installed successfully" on a config sing-box rejects.
+sing_box_check_config() {
+    local bin="$1"
+    local config="$2"
+    local label="$3"
+    local output
+
+    if ! output="$("${bin}" check -c "${config}" 2>&1)"; then
+        echo >&2
+        err "sing-box rejected the generated config:"
+        printf '%s\n' "${output}" >&2
+        fail_step "${label} config validation" \
+            "sing-box check failed for ${config}" \
+            "- The generated config does not match this sing-box version's schema.
+- Report the message above; do not start the service with this config." \
+            "${bin} check -c ${config}"
+        return 1
+    fi
+    ok "${label} config validated by sing-box."
+    return 0
 }
 
 anytls_random_port() {
@@ -1070,223 +1731,330 @@ anytls_public_ip() {
     curl -fsSL --connect-timeout 5 https://api.ipify.org 2>/dev/null || true
 }
 
-anytls_latest_version() {
-    local version
-
-    version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/anytls/anytls-go/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-    [ -n "${version}" ] || die "Could not get the latest AnyTLS version from GitHub."
-    echo "${version}"
-}
+# ===========================================================================
+# AnyTLS (sing-box)
+#
+# Two clearly separated TLS modes, both served by sing-box:
+#   self   - self-signed certificate, no domain, no ACME, no port 80
+#   acme   - a real certificate for a domain the operator controls
+# Reality is never involved here: this module owns all certificate logic,
+# and the VLESS module owns none of it.
+# ===========================================================================
 
 anytls_installed_version() {
-    if [ -f "${ANYTLS_SERVICE_FILE}" ]; then
-        grep '^X-AT-Version=' "${ANYTLS_SERVICE_FILE}" | sed -E 's/^X-AT-Version=//' || true
-    fi
+    [ -f "${ANYTLS_SERVICE_FILE}" ] || return 0
+    grep '^X-AT-Version=' "${ANYTLS_SERVICE_FILE}" | sed -E 's/^X-AT-Version=//' || true
 }
 
 anytls_is_installed() {
-    [ -x "${ANYTLS_BIN}" ] || [ -f "${ANYTLS_SERVICE_FILE}" ]
+    [ -x "${ANYTLS_SING_BOX_BIN}" ] || [ -f "${ANYTLS_SERVICE_FILE}" ] || [ -s "${ANYTLS_JSON}" ] || [ -x "${ANYTLS_BIN}" ]
 }
 
 anytls_is_active() {
-    systemctl is-active "${ANYTLS_SERVICE_NAME}" >/dev/null 2>&1
+    service_is_active "${ANYTLS_SERVICE_NAME}"
 }
 
-anytls_config_port() {
-    [ -f "${ANYTLS_CONFIG}" ] || return 0
-    sed -nE 's/^[[:space:]]*listen:[[:space:]]*.*:([0-9]+)[[:space:]]*$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+# True when the box still carries the old anytls-go layout this script used
+# before AnyTLS moved onto sing-box.
+anytls_has_legacy_layout() {
+    [ -x "${ANYTLS_BIN}" ] || [ -f "${ANYTLS_LEGACY_SING_BOX_CONFIG}" ] || \
+        { [ -f "${ANYTLS_CONFIG}" ] && [ ! -s "${ANYTLS_JSON}" ]; }
 }
 
-anytls_config_password() {
-    [ -f "${ANYTLS_CONFIG}" ] || return 0
-    sed -nE 's/^[[:space:]]*password:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+# ---- read-back accessors: the on-disk JSON is the single source of truth ----
+
+anytls_cfg_get() {
+    local filter="$1"
+    local value
+
+    [ -s "${ANYTLS_JSON}" ] || return 1
+    value="$(jq -r "${filter}" "${ANYTLS_JSON}" 2>/dev/null || true)"
+    [ -n "${value}" ] && [ "${value}" != "null" ] || return 1
+    printf '%s' "${value}"
 }
 
-anytls_config_domain() {
-    [ -f "${ANYTLS_CONFIG}" ] || return 0
-    sed -nE 's/^[[:space:]]*domain:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+anytls_cfg_port()     { anytls_cfg_get '.inbounds[0].listen_port'; }
+anytls_cfg_password() { anytls_cfg_get '.inbounds[0].users[0].password'; }
+anytls_cfg_cert()     { anytls_cfg_get '.inbounds[0].tls.certificate_path'; }
+anytls_cfg_key()      { anytls_cfg_get '.inbounds[0].tls.key_path'; }
+anytls_cfg_sni()      { anytls_cfg_get '.inbounds[0].tls.server_name'; }
+
+# TLS mode is recorded next to the config; it decides whether clients must
+# skip certificate verification.
+anytls_mode() {
+    [ -f "${ANYTLS_PARAMS_FILE}" ] || { echo "unknown"; return 0; }
+    grep -E '^MODE=' "${ANYTLS_PARAMS_FILE}" | tail -n1 | cut -d= -f2- || echo "unknown"
 }
 
-anytls_config_cert_path() {
-    [ -f "${ANYTLS_CONFIG}" ] || return 0
-    sed -nE 's/^[[:space:]]*certificate_path:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
+anytls_domain() {
+    [ -f "${ANYTLS_PARAMS_FILE}" ] || return 1
+    grep -E '^DOMAIN=' "${ANYTLS_PARAMS_FILE}" | tail -n1 | cut -d= -f2-
 }
 
-anytls_config_key_path() {
-    [ -f "${ANYTLS_CONFIG}" ] || return 0
-    sed -nE 's/^[[:space:]]*key_path:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
-}
-
-anytls_config_mode() {
-    [ -f "${ANYTLS_CONFIG}" ] || return 0
-    sed -nE 's/^[[:space:]]*mode:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n 1
-}
-
-anytls_write_config() {
-    local port="$1"
-    local password="$2"
-    local domain="${3:-}"
-    local cert_path="${4:-}"
-    local key_path="${5:-}"
-    local mode="${6:-anytls-go}"
+anytls_write_params() {
+    local mode="$1"
+    local domain="${2:-}"
 
     mkdir -p "${ANYTLS_DIR}"
-    cat > "${ANYTLS_CONFIG}" <<EOF
-mode: ${mode}
-listen: :${port}
-auth:
-  type: password
-  password: ${password}
+    cat > "${ANYTLS_PARAMS_FILE}" <<EOF
+MODE=${mode}
+DOMAIN=${domain}
 EOF
+    chmod 600 "${ANYTLS_PARAMS_FILE}"
     if [ -n "${domain}" ]; then
-        cat >> "${ANYTLS_CONFIG}" <<EOF
-domain: ${domain}
-certificate_path: ${cert_path}
-key_path: ${key_path}
-EOF
-        echo "${domain}" > "${ANYTLS_DOMAIN_FILE}"
+        printf '%s\n' "${domain}" > "${ANYTLS_DOMAIN_FILE}"
     fi
-    chmod 600 "${ANYTLS_CONFIG}"
 }
 
-anytls_write_service() {
-    local version="$1"
-    local port="$2"
-    local password="$3"
+anytls_state() {
+    if ! anytls_is_installed; then
+        echo "not_installed"
+        return 0
+    fi
+    if anytls_has_legacy_layout && [ ! -s "${ANYTLS_JSON}" ]; then
+        echo "legacy_layout"
+        return 0
+    fi
+    if [ ! -s "${ANYTLS_JSON}" ]; then
+        echo "config_broken"
+        return 0
+    fi
+    if ! jq -e '.inbounds[0].users[0].password' "${ANYTLS_JSON}" >/dev/null 2>&1; then
+        echo "config_broken"
+        return 0
+    fi
+    if [ ! -x "${ANYTLS_SING_BOX_BIN}" ]; then
+        echo "binary_missing"
+        return 0
+    fi
+    if [ ! -f "${ANYTLS_SERVICE_FILE}" ]; then
+        echo "service_missing"
+        return 0
+    fi
+    echo "ok"
+}
 
-    if [ -z "${version}" ]; then
-        version="$(anytls_installed_version)"
-        version="${version:-unknown}"
+# ---- self-signed certificate ----------------------------------------------
+
+# Generates an EC key + long-lived self-signed certificate. Only regenerates
+# when missing or when forced, so reinstalling does not invalidate clients
+# that already pinned nothing but expect a stable cert.
+anytls_ensure_self_signed_cert() {
+    local force="${1:-false}"
+
+    mkdir -p "${ANYTLS_CERT_DIR}"
+    chmod 700 "${ANYTLS_DIR}" "${ANYTLS_CERT_DIR}" 2>/dev/null || true
+
+    if [ "${force}" != "true" ] && [ -s "${ANYTLS_SELF_CERT}" ] && [ -s "${ANYTLS_SELF_KEY}" ]; then
+        info "Reusing the existing self-signed certificate."
+        return 0
     fi
 
-    cat > "${ANYTLS_SERVICE_FILE}" <<EOF
-[Unit]
-Description=AnyTLS Server Service
-Documentation=https://github.com/anytls/anytls-go
-After=network-online.target
-Wants=network-online.target
-X-AT-Version=${version}
+    info "Generating a self-signed certificate (CN=${ANYTLS_SELF_CN})..."
 
-[Service]
-Type=simple
-User=root
-Environment=TZ=${ANYTLS_TZ}
-ExecStart=${ANYTLS_BIN} -l 0.0.0.0:${port} -p ${password}
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=65535
-StandardOutput=journal
-StandardError=journal
+    if ! openssl ecparam -genkey -name prime256v1 -out "${ANYTLS_SELF_KEY}" 2>/dev/null; then
+        fail_step "self-signed key generation" "openssl could not create an EC private key." \
+            "- Confirm openssl is installed and ${ANYTLS_CERT_DIR} is writable." \
+            "openssl ecparam -genkey -name prime256v1 -out ${ANYTLS_SELF_KEY}"
+        return 1
+    fi
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    if ! openssl req -new -x509 -days 3650 \
+            -key "${ANYTLS_SELF_KEY}" \
+            -out "${ANYTLS_SELF_CERT}" \
+            -subj "/CN=${ANYTLS_SELF_CN}" 2>/dev/null; then
+        fail_step "self-signed certificate generation" "openssl req failed." \
+            "- Confirm openssl is installed and ${ANYTLS_CERT_DIR} is writable." \
+            "openssl req -new -x509 -key ${ANYTLS_SELF_KEY} -out ${ANYTLS_SELF_CERT} -subj /CN=${ANYTLS_SELF_CN}"
+        return 1
+    fi
+
+    chmod 600 "${ANYTLS_SELF_KEY}" "${ANYTLS_SELF_CERT}"
+
+    if [ ! -s "${ANYTLS_SELF_CERT}" ] || [ ! -s "${ANYTLS_SELF_KEY}" ]; then
+        fail_step "self-signed certificate generation" \
+            "Certificate or key file is empty after generation."
+        return 1
+    fi
+
+    ok "Self-signed certificate ready."
+    return 0
 }
 
-anytls_write_sing_box_config() {
-    local port="$1"
-    local password="$2"
-    local domain="$3"
-    local cert_path="$4"
-    local key_path="$5"
+# ---- certificate validation ------------------------------------------------
 
-    mkdir -p "${ANYTLS_DIR}"
-    cat > "${ANYTLS_SING_BOX_CONFIG}" <<EOF
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": ${port},
-      "users": [
-        {
-          "name": "main",
-          "password": "${password}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${domain}",
-        "certificate_path": "${cert_path}",
-        "key_path": "${key_path}"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
+# Confirms a cert/key pair is real, non-empty, parseable, matched, and (for
+# ACME certs) actually covers the requested domain.
+anytls_validate_cert_pair() {
+    local cert="$1"
+    local key="$2"
+    local domain="${3:-}"
+    local cert_mod key_mod
+
+    if [ ! -s "${cert}" ]; then
+        fail_step "certificate check" "Certificate file is missing or empty: ${cert}"
+        return 1
+    fi
+    if [ ! -s "${key}" ]; then
+        fail_step "certificate check" "Private key file is missing or empty: ${key}"
+        return 1
+    fi
+    if ! openssl x509 -in "${cert}" -noout >/dev/null 2>&1; then
+        fail_step "certificate check" "Not a valid PEM certificate: ${cert}" \
+            "" "openssl x509 -in ${cert} -noout -text"
+        return 1
+    fi
+
+    cert_mod="$(openssl x509 -in "${cert}" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null || true)"
+    key_mod="$(openssl pkey -in "${key}" -pubout 2>/dev/null | openssl md5 2>/dev/null || true)"
+    if [ -n "${cert_mod}" ] && [ -n "${key_mod}" ] && [ "${cert_mod}" != "${key_mod}" ]; then
+        fail_step "certificate check" "The certificate and private key do not match." \
+            "- Reissue the certificate, or point the config at the matching key."
+        return 1
+    fi
+
+    if [ -n "${domain}" ]; then
+        if ! openssl x509 -in "${cert}" -noout -text 2>/dev/null | grep -qi -- "${domain}"; then
+            warn "Certificate does not appear to mention ${domain}. Clients may reject it."
+        fi
+    fi
+
+    if ! openssl x509 -in "${cert}" -noout -checkend 0 >/dev/null 2>&1; then
+        warn "Certificate is already expired."
+    fi
+
+    return 0
 }
-EOF
-    chmod 600 "${ANYTLS_SING_BOX_CONFIG}"
+
+# ---- ACME pre-flight -------------------------------------------------------
+
+# Everything that can be checked cheaply before bothering the ACME server.
+# HTTP-01 additionally needs DNS pointing here and a free port 80.
+anytls_acme_preflight() {
+    local domain="$1"
+    local method="$2"
+    local resolved4 resolved6 public4 public6 problems=0
+
+    info "Running certificate pre-flight checks for ${domain}..."
+
+    if ! is_valid_domain "${domain}"; then
+        fail_step "certificate pre-flight" "Not a valid domain name: ${domain}" \
+            "- Enter a hostname such as proxy.example.com (not an IP, not a URL)."
+        return 1
+    fi
+
+    # System clock: ACME rejects requests signed with a badly skewed clock.
+    if has_command date; then
+        local year
+        year="$(date -u +%Y)"
+        if [ "${year}" -lt 2024 ] || [ "${year}" -gt 2100 ]; then
+            fail_step "certificate pre-flight" \
+                "System clock looks wrong: $(date -u). ACME will reject this." \
+                "- Fix the clock first, e.g. 'timedatectl set-ntp true'." \
+                "timedatectl status"
+            return 1
+        fi
+    fi
+
+    # DNS resolution of the domain.
+    resolved4="$(getent ahostsv4 "${domain}" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    resolved6="$(getent ahostsv6 "${domain}" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    if [ -z "${resolved4}" ] && [ -z "${resolved6}" ]; then
+        fail_step "certificate pre-flight" "${domain} does not resolve from this server." \
+            "- Add an A (IPv4) or AAAA (IPv6) record for ${domain}.
+- Wait for DNS propagation, then retry." \
+            "getent ahosts ${domain}"
+        return 1
+    fi
+    ok "DNS resolves ${domain} -> ${resolved4:-${resolved6}}"
+
+    public4="$(detect_public_ipv4)"
+    public6="$(detect_public_ipv6)"
+
+    if [ "${method}" = "http" ]; then
+        # HTTP-01 validation connects back to this host, so the record must
+        # point here and port 80 must be free.
+        if [ -n "${resolved4}" ] && [ -n "${public4}" ] && [ "${resolved4}" != "${public4}" ]; then
+            warn "${domain} resolves to ${resolved4} but this server's public IPv4 is ${public4}."
+            problems=1
+        fi
+        if [ -z "${resolved4}" ] && [ -n "${resolved6}" ] && [ -n "${public6}" ] && [ "${resolved6}" != "${public6}" ]; then
+            warn "${domain} resolves to ${resolved6} but this server's public IPv6 is ${public6}."
+            problems=1
+        fi
+        if [ "${problems}" -ne 0 ]; then
+            fail_step "certificate pre-flight" \
+                "${domain} does not point at this server, so HTTP-01 validation cannot succeed." \
+                "- Point the DNS record at this server, or use the Cloudflare DNS-01 method instead." \
+                "getent ahosts ${domain}"
+            return 1
+        fi
+        if is_port_used 80; then
+            fail_step "certificate pre-flight" "Port 80 is already in use." \
+                "- Stop the web server holding port 80 during issuance, or use DNS-01 instead." \
+                "ss -tlnp | grep ':80 '"
+            return 1
+        fi
+        ok "Port 80 is free and ${domain} points here."
+    fi
+
+    # ACME endpoint reachability.
+    if ! curl -fsS --connect-timeout 10 -o /dev/null https://acme-v02.api.letsencrypt.org/directory 2>/dev/null; then
+        fail_step "certificate pre-flight" \
+            "Cannot reach the Let's Encrypt ACME API from this server." \
+            "- Check outbound HTTPS and DNS on the server.
+- A firewall or upstream filter may be blocking acme-v02.api.letsencrypt.org." \
+            "curl -v https://acme-v02.api.letsencrypt.org/directory"
+        return 1
+    fi
+    ok "ACME API is reachable."
+
+    return 0
 }
 
-anytls_write_sing_box_service() {
-    local version="$1"
-
-    version="${version:-$(anytls_installed_version)}"
-    version="${version#sing-box }"
-    version="${version:-unknown}"
-
-    cat > "${ANYTLS_SERVICE_FILE}" <<EOF
-[Unit]
-Description=AnyTLS Server Service via sing-box
-Documentation=https://sing-box.sagernet.org/configuration/inbound/anytls/
-After=network-online.target
-Wants=network-online.target
-X-AT-Version=sing-box ${version}
-
-[Service]
-Type=simple
-User=root
-Environment=TZ=${ANYTLS_TZ}
-ExecStart=${ANYTLS_SING_BOX_BIN} run -c ${ANYTLS_SING_BOX_CONFIG}
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=65535
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
+# ---- certbot wrappers ------------------------------------------------------
+#
+# stderr is deliberately kept and echoed on failure: the whole point is that
+# "Unable to register an account with ACME server" must reach the operator.
 
 certbot_issue_standalone() {
     local domain="$1"
     local email="$2"
     local staging="${3:-false}"
-    local staging_arg=""
+    local staging_args=()
     local account_args=()
+    local output
+    local rc=0
 
-    install_acme_packages
+    install_acme_packages || return 1
 
-    if is_port_used 80; then
-        die "Port 80 is in use. Stop the service using port 80, then run certificate issuance again."
-    fi
-
-    if [ "${staging}" = "true" ]; then
-        staging_arg="--test-cert"
-    fi
-
+    [ "${staging}" = "true" ] && staging_args=(--test-cert)
     if [ -n "${email}" ]; then
         account_args=(--email "${email}")
     else
         account_args=(--register-unsafely-without-email)
     fi
 
-    certbot certonly --standalone --non-interactive --agree-tos \
+    info "Requesting a certificate for ${domain} via HTTP-01..."
+    output="$(certbot certonly --standalone --non-interactive --agree-tos \
         --preferred-challenges http \
         "${account_args[@]}" \
         -d "${domain}" \
-        ${staging_arg}
+        "${staging_args[@]}" 2>&1)" || rc=$?
+
+    printf '%s\n' "${output}"
+
+    if [ "${rc}" -ne 0 ]; then
+        fail_step "certificate issuance (HTTP-01)" \
+            "certbot exited with status ${rc}. The real error is printed above." \
+            "- 'Unable to register an account' usually means the server cannot reach
+  the ACME API, the clock is wrong, or the email was rejected.
+- Confirm ${domain} points at this server and port 80 is reachable from outside.
+- Repeated failures can hit Let's Encrypt rate limits; try --test-cert (staging)." \
+            "cat /var/log/letsencrypt/letsencrypt.log"
+        return 1
+    fi
+    return 0
 }
 
 certbot_issue_cloudflare() {
@@ -1297,37 +2065,53 @@ certbot_issue_cloudflare() {
     local propagation="${5:-60}"
     local staging_args=()
     local account_args=()
+    local output
+    local rc=0
 
-    install_cloudflare_acme_packages
+    install_cloudflare_acme_packages || return 1
 
     mkdir -p "$(dirname "${CF_CERTBOT_CREDENTIALS}")"
     if [ -n "${token}" ]; then
-        cat > "${CF_CERTBOT_CREDENTIALS}" <<EOF
-dns_cloudflare_api_token = ${token}
-EOF
+        printf 'dns_cloudflare_api_token = %s\n' "${token}" > "${CF_CERTBOT_CREDENTIALS}"
         chmod 600 "${CF_CERTBOT_CREDENTIALS}"
     fi
 
-    [ -f "${CF_CERTBOT_CREDENTIALS}" ] || die "Cloudflare credentials file not found: ${CF_CERTBOT_CREDENTIALS}"
+    if [ ! -f "${CF_CERTBOT_CREDENTIALS}" ]; then
+        fail_step "certificate issuance (DNS-01)" \
+            "Cloudflare credentials file not found: ${CF_CERTBOT_CREDENTIALS}" \
+            "- Provide an API token with Zone:DNS:Edit and Zone:Zone:Read."
+        return 1
+    fi
     chmod 600 "${CF_CERTBOT_CREDENTIALS}" 2>/dev/null || true
 
-    if [ "${staging}" = "true" ]; then
-        staging_args=(--test-cert)
-    fi
-
+    [ "${staging}" = "true" ] && staging_args=(--test-cert)
     if [ -n "${email}" ]; then
         account_args=(--email "${email}")
     else
         account_args=(--register-unsafely-without-email)
     fi
 
-    certbot certonly --dns-cloudflare \
+    info "Requesting a certificate for ${domain} via Cloudflare DNS-01..."
+    output="$(certbot certonly --dns-cloudflare \
         --dns-cloudflare-credentials "${CF_CERTBOT_CREDENTIALS}" \
         --dns-cloudflare-propagation-seconds "${propagation}" \
         --non-interactive --agree-tos \
         "${account_args[@]}" \
         -d "${domain}" \
-        "${staging_args[@]}"
+        "${staging_args[@]}" 2>&1)" || rc=$?
+
+    printf '%s\n' "${output}"
+
+    if [ "${rc}" -ne 0 ]; then
+        fail_step "certificate issuance (DNS-01)" \
+            "certbot exited with status ${rc}. The real error is printed above." \
+            "- Check the API token scope (Zone:DNS:Edit + Zone:Zone:Read) and that it
+  covers ${domain}.
+- Increase the propagation wait if Cloudflare was slow to publish the record." \
+            "cat /var/log/letsencrypt/letsencrypt.log"
+        return 1
+    fi
+    return 0
 }
 
 copy_letsencrypt_cert_for_anytls() {
@@ -1336,15 +2120,21 @@ copy_letsencrypt_cert_for_anytls() {
     local cert_path="${ANYTLS_CERT_DIR}/${domain}.fullchain.pem"
     local key_path="${ANYTLS_CERT_DIR}/${domain}.privkey.pem"
 
-    [ -f "${src_dir}/fullchain.pem" ] || die "Certificate not found: ${src_dir}/fullchain.pem"
-    [ -f "${src_dir}/privkey.pem" ] || die "Private key not found: ${src_dir}/privkey.pem"
+    if [ ! -f "${src_dir}/fullchain.pem" ] || [ ! -f "${src_dir}/privkey.pem" ]; then
+        fail_step "certificate install" \
+            "Let's Encrypt files were not found under ${src_dir}" \
+            "- certbot may have reported success without writing files.
+- List what exists with: certbot certificates" \
+            "ls -l ${src_dir}"
+        return 1
+    fi
 
     mkdir -p "${ANYTLS_CERT_DIR}"
     cp -L "${src_dir}/fullchain.pem" "${cert_path}"
     cp -L "${src_dir}/privkey.pem" "${key_path}"
     chmod 600 "${cert_path}" "${key_path}"
 
-    echo "${cert_path}|${key_path}"
+    printf '%s|%s' "${cert_path}" "${key_path}"
 }
 
 install_cert_renew_hook() {
@@ -1367,421 +2157,572 @@ EOF
     chmod +x "${hook_file}"
 }
 
-anytls_download_binary() {
-    local version
-    local arch
-    local url
-    local tmpdir
+# ---- config + service ------------------------------------------------------
 
-    install_anytls_packages
+anytls_write_config() {
+    local port="$1"
+    local password="$2"
+    local cert_path="$3"
+    local key_path="$4"
+    local sni="${5:-}"
+    local sni_line=""
+
     mkdir -p "${ANYTLS_DIR}"
+    chmod 700 "${ANYTLS_DIR}"
 
-    arch="$(anytls_arch)"
-    version="$(anytls_latest_version)"
-    url="https://github.com/anytls/anytls-go/releases/download/${version}/anytls_${version#v}_linux_${arch}.zip"
-    tmpdir="$(mktemp -d)"
+    if [ -n "${sni}" ]; then
+        sni_line="$(printf '\n        "server_name": "%s",' "${sni}")"
+    fi
 
-    info "Downloading AnyTLS ${version} (${arch})..."
-    warn "Source: ${url}"
-
-    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/anytls.zip"
-    unzip -o "${tmpdir}/anytls.zip" -d "${tmpdir}" >/dev/null
-
-    [ -f "${tmpdir}/anytls-server" ] || {
-        rm -rf "${tmpdir}"
-        die "anytls-server was not found in the downloaded archive."
+    cat > "${ANYTLS_JSON}" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${port},
+      "users": [
+        {
+          "name": "main",
+          "password": "${password}"
+        }
+      ],
+      "padding_scheme": [],
+      "tls": {
+        "enabled": true,${sni_line}
+        "certificate_path": "${cert_path}",
+        "key_path": "${key_path}"
+      }
     }
-
-    install -m 0755 "${tmpdir}/anytls-server" "${ANYTLS_BIN}"
-    rm -rf "${tmpdir}"
-    ANYTLS_DOWNLOADED_VERSION="${version}"
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    chmod 600 "${ANYTLS_JSON}"
 }
 
-anytls_restart() {
-    systemctl daemon-reload
-    systemctl enable "${ANYTLS_SERVICE_NAME}" >/dev/null
-    systemctl restart "${ANYTLS_SERVICE_NAME}"
-    systemctl --no-pager --full status "${ANYTLS_SERVICE_NAME}" | sed -n '1,8p' || true
+anytls_write_service() {
+    local version="$1"
+
+    version="${version:-$(anytls_installed_version)}"
+    version="${version:-unknown}"
+
+    cat > "${ANYTLS_SERVICE_FILE}" <<EOF
+[Unit]
+Description=AnyTLS Server Service via sing-box
+Documentation=https://sing-box.sagernet.org/configuration/inbound/anytls/
+After=network-online.target
+Wants=network-online.target
+X-AT-Version=${version}
+
+[Service]
+Type=simple
+User=root
+ExecStart=${ANYTLS_SING_BOX_BIN} run -c ${ANYTLS_JSON}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 anytls_client_export() {
-    local port
-    local password
-    local ip
-    local domain
-    local mode
-    local query
-    local insecure_text
-    local alias_enc
-    local link
-    local link_enc
+    local port password host mode domain sni insecure query alias_enc link link_enc
 
-    [ -f "${ANYTLS_CONFIG}" ] || die "AnyTLS config not found: ${ANYTLS_CONFIG}"
-
-    port="$(anytls_config_port)"
-    password="$(anytls_config_password)"
-    domain="$(anytls_config_domain)"
-    mode="$(anytls_config_mode)"
-    ip="$(anytls_public_ip)"
-    ip="${ip:-YOUR_SERVER_IP}"
-    query="?allowInsecure=1&insecure=1"
-    insecure_text="true"
-    if [ "${mode}" = "sing-box-tls" ] && [ -n "${domain}" ]; then
-        query="?sni=${domain}&allowInsecure=0&insecure=0"
-        insecure_text="false"
+    if [ ! -s "${ANYTLS_JSON}" ]; then
+        err "AnyTLS config not found: ${ANYTLS_JSON}"
+        return 1
     fi
+
+    port="$(anytls_cfg_port)" || { err "Could not read listen_port from ${ANYTLS_JSON}"; return 1; }
+    password="$(anytls_cfg_password)" || { err "Could not read password from ${ANYTLS_JSON}"; return 1; }
+    sni="$(anytls_cfg_sni 2>/dev/null || true)"
+    mode="$(anytls_mode)"
+    domain="$(anytls_domain 2>/dev/null || true)"
+    host="$(client_endpoint_host)"
+
+    if [ "${mode}" = "acme" ] && [ -n "${domain}" ]; then
+        # A real certificate: clients verify normally and connect by hostname.
+        host="${domain}"
+        insecure="false"
+        query="?sni=${domain}&alpn=h2&insecure=0"
+    else
+        # Self-signed: verification must be disabled on the client.
+        insecure="true"
+        query="?sni=${sni:-${ANYTLS_SELF_CN}}&alpn=h2&insecure=1&allowInsecure=1"
+    fi
+
     alias_enc="$(urlencode "${ANYTLS_ALIAS}")"
-    link="anytls://${password}@${ip}:${port}${query}#${alias_enc}"
+    link="anytls://${password}@${host}:${port}${query}#${alias_enc}"
     link_enc="$(urlencode "${link}")"
 
     mkdir -p "${ANYTLS_DIR}"
     cat > "${ANYTLS_CLIENT_FILE}" <<EOF
 AnyTLS client parameters
-Address: ${ip}
-Domain: ${domain:-none}
-SNI: ${domain:-none}
+(read back from ${ANYTLS_JSON})
+TLS mode: ${mode}
+Address: ${host}
 Port: ${port}
 Password: ${password}
-Transport: tls
-Allow insecure / skip certificate verification: ${insecure_text}
-Mode: ${mode:-anytls-go}
+SNI: ${sni:-${domain:-${ANYTLS_SELF_CN}}}
+Domain: ${domain:-none}
+Skip certificate verification: ${insecure}
 URL: ${link}
 QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link_enc}
 EOF
+    chmod 600 "${ANYTLS_CLIENT_FILE}"
 
     echo
     ok "AnyTLS client parameters"
     cat "${ANYTLS_CLIENT_FILE}"
+    if [ "${mode}" != "acme" ]; then
+        echo
+        warn "Self-signed mode: the client MUST skip certificate verification"
+        warn "(insecure / allowInsecure / 'Allow insecure' = on)."
+    fi
+    return 0
 }
 
-anytls_install() {
-    local version
-    local port
-    local password
+anytls_verify_client_match() {
+    local port password mismatch=0
 
-    require_root
+    port="$(anytls_cfg_port)" || return 1
+    password="$(anytls_cfg_password)" || return 1
+    [ -s "${ANYTLS_CLIENT_FILE}" ] || return 1
 
-    anytls_download_binary
-    version="${ANYTLS_DOWNLOADED_VERSION}"
-    port="$(anytls_prompt_port)"
-    password="$(anytls_password)"
+    grep -q "${password}@" "${ANYTLS_CLIENT_FILE}" || mismatch=1
+    grep -q ":${port}?" "${ANYTLS_CLIENT_FILE}" || mismatch=1
 
-    anytls_write_service "${version}" "${port}" "${password}"
-    anytls_write_config "${port}" "${password}"
-    anytls_restart
+    if [ "${mismatch}" -ne 0 ]; then
+        warn "Client link does not match the server config; regenerate it from the AnyTLS menu."
+        return 1
+    fi
+    ok "Client link matches the server config (password, port)."
+    return 0
+}
 
-    if anytls_is_active; then
-        ok "AnyTLS is installed and running."
-        anytls_client_export
+# Writes config + unit, validates with sing-box, starts, verifies, exports.
+anytls_apply() {
+    local port="$1" password="$2" cert="$3" key="$4" sni="$5" mode="$6" domain="$7" version="$8"
+
+    anytls_validate_cert_pair "${cert}" "${key}" "${domain}" || return 1
+
+    anytls_write_config "${port}" "${password}" "${cert}" "${key}" "${sni}"
+    anytls_write_params "${mode}" "${domain}"
+    anytls_write_service "${version}"
+
+    sing_box_check_config "${ANYTLS_SING_BOX_BIN}" "${ANYTLS_JSON}" "AnyTLS" || return 1
+    activate_and_verify "${ANYTLS_SERVICE_NAME}" "${port}" "AnyTLS" || return 1
+
+    ok "AnyTLS is running on port ${port} (${mode} certificate)."
+    anytls_client_export || return 1
+    anytls_verify_client_match || true
+    return 0
+}
+
+# Retires the old anytls-go unit/binary before sing-box takes over the port.
+anytls_migrate_legacy() {
+    anytls_has_legacy_layout || return 0
+
+    warn "Detected the older anytls-go layout; migrating this module to sing-box."
+    systemctl disable --now "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
+    backup_file "${ANYTLS_CONFIG}"
+    backup_file "${ANYTLS_LEGACY_SING_BOX_CONFIG}"
+    rm -f "${ANYTLS_BIN}"
+    ok "Legacy AnyTLS files backed up; the anytls-go binary was removed."
+    return 0
+}
+
+# Recovers port/password from whichever old layout is present so a migration
+# does not force clients to be reconfigured.
+anytls_recover_port_password() {
+    local port="" password=""
+
+    if [ -s "${ANYTLS_JSON}" ]; then
+        port="$(anytls_cfg_port 2>/dev/null || true)"
+        password="$(anytls_cfg_password 2>/dev/null || true)"
+    fi
+    if [ -z "${port}" ] && [ -f "${ANYTLS_LEGACY_SING_BOX_CONFIG}" ]; then
+        port="$(jq -r '.inbounds[0].listen_port // empty' "${ANYTLS_LEGACY_SING_BOX_CONFIG}" 2>/dev/null || true)"
+        password="$(jq -r '.inbounds[0].users[0].password // empty' "${ANYTLS_LEGACY_SING_BOX_CONFIG}" 2>/dev/null || true)"
+    fi
+    if [ -z "${port}" ] && [ -f "${ANYTLS_CONFIG}" ]; then
+        port="$(sed -nE 's/^[[:space:]]*listen:[[:space:]]*.*:([0-9]+)[[:space:]]*$/\1/p' "${ANYTLS_CONFIG}" | head -n1 || true)"
+        password="$(sed -nE 's/^[[:space:]]*password:[[:space:]]*(.*)$/\1/p' "${ANYTLS_CONFIG}" | head -n1 || true)"
+    fi
+
+    printf '%s|%s' "${port}" "${password}"
+}
+
+# ---- install entry points --------------------------------------------------
+
+anytls_install_self_signed() {
+    local state choice recovered port password version
+
+    preflight_common "AnyTLS" || return 1
+
+    state="$(anytls_state)"
+    if [ "${state}" != "not_installed" ]; then
+        echo
+        warn "AnyTLS is already present (state: ${state})."
+        echo "1. Keep the existing port and password; rebuild with a self-signed certificate"
+        echo "2. Back up the current config, then generate a completely new one"
+        echo "3. Show the current client config"
+        echo "0. Cancel"
+        read -rp "Select [0-3]: " choice
+        case "${choice}" in
+            1)
+                recovered="$(anytls_recover_port_password)"
+                port="${recovered%%|*}"
+                password="${recovered#*|}"
+                ;;
+            2)
+                backup_file "${ANYTLS_JSON}"
+                backup_file "${ANYTLS_PARAMS_FILE}"
+                ;;
+            3) anytls_client_export; return $? ;;
+            *) info "Cancelled."; return 0 ;;
+        esac
+    fi
+
+    anytls_migrate_legacy
+
+    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}" || return 1
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+
+    if [ -z "${port:-}" ]; then
+        port="$(anytls_prompt_port)"
     else
-        warn "AnyTLS did not become active. Check: journalctl -u ${ANYTLS_SERVICE_NAME} -e"
+        info "Reusing existing port ${port}."
     fi
+    if [ -z "${password:-}" ]; then
+        password="$(anytls_password)"
+    else
+        info "Reusing existing password."
+    fi
+
+    anytls_ensure_self_signed_cert false || return 1
+
+    anytls_apply "${port}" "${password}" \
+        "${ANYTLS_SELF_CERT}" "${ANYTLS_SELF_KEY}" \
+        "${ANYTLS_SELF_CN}" "self" "" "${version}"
 }
 
-anytls_update() {
-    local version
-    local port
-    local password
-    local mode
-    local domain
-    local cert_path
-    local key_path
+# Shared tail for all three real-certificate paths.
+anytls_finish_with_cert() {
+    local domain="$1"
+    local cert_pair cert_path key_path version port password recovered
 
-    require_root
-    anytls_is_installed || die "AnyTLS is not installed."
-
-    port="$(anytls_config_port)"
-    password="$(anytls_config_password)"
-    mode="$(anytls_config_mode)"
-    domain="$(anytls_config_domain)"
-    cert_path="$(anytls_config_cert_path)"
-    key_path="$(anytls_config_key_path)"
-    port="${port:-$(anytls_random_port)}"
-    password="${password:-$(anytls_password)}"
-
-    if [ "${mode}" = "sing-box-tls" ]; then
-        [ -n "${domain}" ] || die "AnyTLS TLS domain is missing."
-        [ -f "${cert_path}" ] || die "Certificate file is missing: ${cert_path}"
-        [ -f "${key_path}" ] || die "Key file is missing: ${key_path}"
-        install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
-        version="${SING_BOX_DOWNLOADED_VERSION}"
-        anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
-        anytls_write_sing_box_service "${version}"
-        anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
-        anytls_restart
-        anytls_client_export
-        return 0
+    if ! cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"; then
+        return 1
     fi
+    cert_path="${cert_pair%%|*}"
+    key_path="${cert_pair#*|}"
 
-    anytls_download_binary
-    version="${ANYTLS_DOWNLOADED_VERSION}"
+    anytls_validate_cert_pair "${cert_path}" "${key_path}" "${domain}" || return 1
+    install_cert_renew_hook
 
-    anytls_write_service "${version}" "${port}" "${password}"
-    anytls_write_config "${port}" "${password}"
-    anytls_restart
-    anytls_client_export
+    anytls_migrate_legacy
+    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}" || return 1
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+
+    recovered="$(anytls_recover_port_password)"
+    port="${recovered%%|*}"
+    password="${recovered#*|}"
+    if [ -z "${port}" ]; then
+        port="$(anytls_prompt_port)"
+    else
+        info "Reusing existing port ${port}."
+    fi
+    [ -n "${password}" ] || password="$(anytls_password)"
+
+    anytls_apply "${port}" "${password}" "${cert_path}" "${key_path}" \
+        "${domain}" "acme" "${domain}" "${version}"
+}
+
+# Offers a graceful downgrade instead of leaving the box with nothing.
+anytls_offer_self_signed_fallback() {
+    local choice
+
+    echo
+    warn "The real-certificate path did not complete."
+    read -rp "Fall back to self-signed mode so AnyTLS still works? [y/N]: " choice
+    if [[ "${choice}" =~ ^[Yy]$ ]]; then
+        anytls_install_self_signed
+        return $?
+    fi
+    info "No fallback performed. AnyTLS was left unchanged."
+    return 1
 }
 
 anytls_install_with_acme_cert() {
-    local domain
-    local email
-    local staging_choice
-    local staging="false"
-    local cert_pair
-    local cert_path
-    local key_path
-    local version
-    local port
-    local password
+    local domain email staging_choice staging="false"
 
-    require_root
+    preflight_common "AnyTLS" || return 1
 
     echo
-    warn "This mode uses certbot standalone HTTP-01. Your domain must point to this VPS and port 80 must be reachable."
-    read -rp "Domain for AnyTLS certificate: " domain
-    [ -n "${domain}" ] || die "Domain is required."
-    read -rp "Email for Let's Encrypt notices [Enter = no email]: " email
-    read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
-    if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
-        staging="true"
+    info "Real certificate via HTTP-01 (certbot standalone)."
+    warn "Your domain must already point at this server and port 80 must be reachable."
+    read -rp "Domain for the AnyTLS certificate: " domain
+    if ! is_valid_domain "${domain}"; then
+        fail_step "AnyTLS certificate setup" "Not a valid domain: ${domain}"
+        return 1
+    fi
+    read -rp "Email for Let's Encrypt notices [Enter = none]: " email
+    read -rp "Use the Let's Encrypt staging (test) certificate? [y/N]: " staging_choice
+    [[ "${staging_choice}" =~ ^[Yy]$ ]] && staging="true"
+
+    if ! anytls_acme_preflight "${domain}" "http"; then
+        anytls_offer_self_signed_fallback
+        return $?
     fi
 
-    certbot_issue_standalone "${domain}" "${email}" "${staging}"
-    cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"
-    cert_path="${cert_pair%%|*}"
-    key_path="${cert_pair#*|}"
-    install_cert_renew_hook
-
-    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
-    version="${SING_BOX_DOWNLOADED_VERSION}"
-    port="$(anytls_prompt_port)"
-    password="$(anytls_password)"
-
-    anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
-    anytls_write_sing_box_service "${version}"
-    anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
-    anytls_restart
-
-    if anytls_is_active; then
-        ok "Secure AnyTLS via sing-box is installed and running."
-        anytls_client_export
-    else
-        warn "AnyTLS did not become active. Check: journalctl -u ${ANYTLS_SERVICE_NAME} -e"
+    if ! certbot_issue_standalone "${domain}" "${email}" "${staging}"; then
+        anytls_offer_self_signed_fallback
+        return $?
     fi
+
+    anytls_finish_with_cert "${domain}"
 }
 
 anytls_install_with_cloudflare_cert() {
-    local domain
-    local email
-    local token
-    local propagation
-    local staging_choice
-    local staging="false"
-    local cert_pair
-    local cert_path
-    local key_path
-    local version
-    local port
-    local password
+    local domain email token propagation staging_choice staging="false"
 
-    require_root
+    preflight_common "AnyTLS" || return 1
 
     echo
-    warn "This mode uses Cloudflare DNS-01. Port 80 does not need to be reachable."
-    warn "Create a Cloudflare API token with Zone:DNS:Edit and Zone:Zone:Read for this domain."
-    read -rp "Domain for AnyTLS certificate: " domain
-    [ -n "${domain}" ] || die "Domain is required."
-    read -rp "Email for Let's Encrypt notices [Enter = no email]: " email
+    info "Real certificate via Cloudflare DNS-01."
+    warn "Port 80 is not needed. Create a token with Zone:DNS:Edit and Zone:Zone:Read."
+    read -rp "Domain for the AnyTLS certificate: " domain
+    if ! is_valid_domain "${domain}"; then
+        fail_step "AnyTLS certificate setup" "Not a valid domain: ${domain}"
+        return 1
+    fi
+    read -rp "Email for Let's Encrypt notices [Enter = none]: " email
     if [ -f "${CF_CERTBOT_CREDENTIALS}" ]; then
         read -rsp "Cloudflare API token [Enter = reuse saved token]: " token
         echo
     else
         read -rsp "Cloudflare API token: " token
         echo
-        [ -n "${token}" ] || die "Cloudflare API token is required."
+        if [ -z "${token}" ]; then
+            fail_step "AnyTLS certificate setup" "A Cloudflare API token is required."
+            return 1
+        fi
     fi
     read -rp "DNS propagation wait seconds [Enter = 60]: " propagation
     propagation="${propagation:-60}"
-    [[ "${propagation}" =~ ^[0-9]+$ ]] || die "Invalid propagation seconds: ${propagation}"
-    read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
-    if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
-        staging="true"
+    if ! [[ "${propagation}" =~ ^[0-9]+$ ]]; then
+        fail_step "AnyTLS certificate setup" "Invalid propagation seconds: ${propagation}"
+        return 1
+    fi
+    read -rp "Use the Let's Encrypt staging (test) certificate? [y/N]: " staging_choice
+    [[ "${staging_choice}" =~ ^[Yy]$ ]] && staging="true"
+
+    # DNS-01 does not need the record to point here, so skip that check.
+    if ! anytls_acme_preflight "${domain}" "dns"; then
+        anytls_offer_self_signed_fallback
+        return $?
     fi
 
-    certbot_issue_cloudflare "${domain}" "${email}" "${token}" "${staging}" "${propagation}"
-    cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"
-    cert_path="${cert_pair%%|*}"
-    key_path="${cert_pair#*|}"
-    install_cert_renew_hook
-
-    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
-    version="${SING_BOX_DOWNLOADED_VERSION}"
-    port="$(anytls_prompt_port)"
-    password="$(anytls_password)"
-
-    anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
-    anytls_write_sing_box_service "${version}"
-    anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
-    anytls_restart
-
-    if anytls_is_active; then
-        ok "Secure AnyTLS via Cloudflare DNS certificate is installed and running."
-        anytls_client_export
-    else
-        warn "AnyTLS did not become active. Check: journalctl -u ${ANYTLS_SERVICE_NAME} -e"
+    if ! certbot_issue_cloudflare "${domain}" "${email}" "${token}" "${staging}" "${propagation}"; then
+        anytls_offer_self_signed_fallback
+        return $?
     fi
+
+    anytls_finish_with_cert "${domain}"
 }
 
 anytls_apply_existing_cert() {
     local domain
-    local port
-    local password
-    local cert_pair
-    local cert_path
-    local key_path
-    local version
 
-    require_root
+    preflight_common "AnyTLS" || return 1
 
     read -rp "Existing Let's Encrypt domain to apply: " domain
-    [ -n "${domain}" ] || die "Domain is required."
+    if ! is_valid_domain "${domain}"; then
+        fail_step "AnyTLS certificate setup" "Not a valid domain: ${domain}"
+        return 1
+    fi
 
-    cert_pair="$(copy_letsencrypt_cert_for_anytls "${domain}")"
-    cert_path="${cert_pair%%|*}"
-    key_path="${cert_pair#*|}"
-    install_cert_renew_hook
+    if [ ! -d "/etc/letsencrypt/live/${domain}" ]; then
+        fail_step "AnyTLS certificate setup" \
+            "No existing certificate found at /etc/letsencrypt/live/${domain}" \
+            "- List what is available with: certbot certificates
+- Or issue a new certificate from the AnyTLS menu." \
+            "certbot certificates"
+        return 1
+    fi
 
-    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}"
+    anytls_finish_with_cert "${domain}"
+}
+
+anytls_update() {
+    local port password cert key sni mode domain version
+
+    preflight_common "AnyTLS" || return 1
+
+    if ! anytls_is_installed; then
+        fail_step "AnyTLS update" "AnyTLS is not installed." "- Install it first."
+        return 1
+    fi
+
+    if [ ! -s "${ANYTLS_JSON}" ]; then
+        warn "No sing-box AnyTLS config present; running a self-signed install instead."
+        anytls_install_self_signed
+        return $?
+    fi
+
+    port="$(anytls_cfg_port)" || { fail_step "AnyTLS update" "listen_port missing from config."; return 1; }
+    password="$(anytls_cfg_password)" || { fail_step "AnyTLS update" "password missing from config."; return 1; }
+    cert="$(anytls_cfg_cert)" || { fail_step "AnyTLS update" "certificate_path missing from config."; return 1; }
+    key="$(anytls_cfg_key)" || { fail_step "AnyTLS update" "key_path missing from config."; return 1; }
+    sni="$(anytls_cfg_sni 2>/dev/null || true)"
+    mode="$(anytls_mode)"
+    domain="$(anytls_domain 2>/dev/null || true)"
+
+    info "Updating sing-box while keeping the existing port, password and certificate."
+    install_sing_box_binary "${ANYTLS_SING_BOX_BIN}" || return 1
     version="${SING_BOX_DOWNLOADED_VERSION}"
-    port="$(anytls_config_port)"
-    password="$(anytls_config_password)"
-    port="${port:-$(anytls_prompt_port)}"
-    password="${password:-$(anytls_password)}"
 
-    anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
-    anytls_write_sing_box_service "${version}"
-    anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
-    anytls_restart
-    anytls_client_export
+    anytls_apply "${port}" "${password}" "${cert}" "${key}" "${sni}" "${mode}" "${domain}" "${version}"
+}
+
+anytls_change_value() {
+    local field="$1"
+    local port password cert key sni mode domain
+
+    preflight_common "AnyTLS" || return 1
+
+    if [ ! -s "${ANYTLS_JSON}" ] || [ ! -x "${ANYTLS_SING_BOX_BIN}" ]; then
+        fail_step "AnyTLS change ${field}" "AnyTLS is not fully installed." \
+            "- Run an AnyTLS install option first."
+        return 1
+    fi
+
+    port="$(anytls_cfg_port)" || return 1
+    password="$(anytls_cfg_password)" || return 1
+    cert="$(anytls_cfg_cert)" || return 1
+    key="$(anytls_cfg_key)" || return 1
+    sni="$(anytls_cfg_sni 2>/dev/null || true)"
+    mode="$(anytls_mode)"
+    domain="$(anytls_domain 2>/dev/null || true)"
+
+    case "${field}" in
+        port)     port="$(anytls_prompt_port)" ;;
+        password) password="$(anytls_password)"; info "New password: ${password}" ;;
+        *) fail_step "AnyTLS change" "Unknown field: ${field}"; return 1 ;;
+    esac
+
+    backup_file "${ANYTLS_JSON}"
+    anytls_apply "${port}" "${password}" "${cert}" "${key}" "${sni}" "${mode}" "${domain}" ""
 }
 
 renew_anytls_certificate() {
-    require_root
-    install_acme_packages
-    certbot renew
-    if anytls_is_installed; then
-        systemctl restart "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
+    local rc=0
+    local output
+
+    preflight_common "AnyTLS" || return 1
+    install_acme_packages || return 1
+
+    output="$(certbot renew 2>&1)" || rc=$?
+    printf '%s\n' "${output}"
+
+    if [ "${rc}" -ne 0 ]; then
+        fail_step "certificate renewal" "certbot renew exited with status ${rc}." \
+            "- The error above explains which domain failed." \
+            "cat /var/log/letsencrypt/letsencrypt.log"
+        return 1
     fi
-    anytls_client_export
+
+    if anytls_is_installed && [ -s "${ANYTLS_JSON}" ]; then
+        systemctl restart "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
+        anytls_client_export || true
+    fi
+    return 0
 }
 
 anytls_uninstall() {
     local confirm
 
     require_root
-    anytls_is_installed || die "AnyTLS is not installed."
+    if ! anytls_is_installed; then
+        warn "AnyTLS is not installed."
+        return 0
+    fi
 
-    read -rp "Uninstall AnyTLS and delete ${ANYTLS_DIR}? [y/N]: " confirm
+    warn "This removes only files created by this module:"
+    echo "  ${ANYTLS_DIR}"
+    echo "  ${ANYTLS_SERVICE_FILE}"
+    warn "Let's Encrypt certificates under /etc/letsencrypt are NOT removed."
+    read -rp "Uninstall AnyTLS? [y/N]: " confirm
     [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
 
     systemctl disable --now "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
     rm -f "${ANYTLS_SERVICE_FILE}"
     rm -rf "${ANYTLS_DIR}"
     systemctl daemon-reload 2>/dev/null || true
-    ok "AnyTLS uninstalled."
-}
-
-anytls_change_port() {
-    local port
-    local password
-    local mode
-    local domain
-    local cert_path
-    local key_path
-
-    require_root
-    anytls_is_installed || die "AnyTLS is not installed."
-
-    port="$(anytls_prompt_port)"
-    password="$(anytls_config_password)"
-    password="${password:-$(anytls_password)}"
-    mode="$(anytls_config_mode)"
-    domain="$(anytls_config_domain)"
-    cert_path="$(anytls_config_cert_path)"
-    key_path="$(anytls_config_key_path)"
-
-    if [ "${mode}" = "sing-box-tls" ]; then
-        anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
-        anytls_write_sing_box_service ""
-        anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
-    else
-        anytls_write_service "" "${port}" "${password}"
-        anytls_write_config "${port}" "${password}"
-    fi
-    anytls_restart
-    anytls_client_export
-}
-
-anytls_change_password() {
-    local port
-    local password
-    local mode
-    local domain
-    local cert_path
-    local key_path
-
-    require_root
-    anytls_is_installed || die "AnyTLS is not installed."
-
-    port="$(anytls_config_port)"
-    port="${port:-$(anytls_random_port)}"
-    password="$(anytls_password)"
-    mode="$(anytls_config_mode)"
-    domain="$(anytls_config_domain)"
-    cert_path="$(anytls_config_cert_path)"
-    key_path="$(anytls_config_key_path)"
-
-    if [ "${mode}" = "sing-box-tls" ]; then
-        anytls_write_sing_box_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}"
-        anytls_write_sing_box_service ""
-        anytls_write_config "${port}" "${password}" "${domain}" "${cert_path}" "${key_path}" "sing-box-tls"
-    else
-        anytls_write_service "" "${port}" "${password}"
-        anytls_write_config "${port}" "${password}"
-    fi
-    anytls_restart
-    anytls_client_export
+    ok "AnyTLS uninstalled. Snell and VLESS+Reality were not touched."
 }
 
 anytls_status() {
-    if anytls_is_installed; then
-        echo
-        ok "AnyTLS installed"
-        echo "Version: $(anytls_installed_version)"
-        echo "Mode: $(anytls_config_mode)"
-        echo "Domain: $(anytls_config_domain)"
-        echo "Port: $(anytls_config_port)"
-        if anytls_is_active; then
-            echo "Status: running"
-        else
-            echo "Status: stopped"
-        fi
-        systemctl --no-pager --full status "${ANYTLS_SERVICE_NAME}" | sed -n '1,8p' || true
-    else
+    local port
+
+    if ! anytls_is_installed; then
         warn "AnyTLS is not installed."
+        return 0
     fi
+
+    echo
+    ok "AnyTLS"
+    echo "State: $(anytls_state)"
+    echo "sing-box version: $(anytls_installed_version)"
+    echo "TLS mode: $(anytls_mode)"
+    echo "Domain: $(anytls_domain 2>/dev/null || echo none)"
+    echo "Port: $(anytls_cfg_port 2>/dev/null || echo unknown)"
+
+    if anytls_is_active; then
+        echo "Service: running"
+    else
+        echo "Service: stopped"
+    fi
+
+    port="$(anytls_cfg_port 2>/dev/null || true)"
+    if [ -n "${port}" ]; then
+        if port_is_listening "${port}" 1; then
+            echo "Listener: port ${port} is listening"
+        else
+            warn "Listener: nothing is listening on port ${port}"
+        fi
+    fi
+
+    systemctl --no-pager --full status "${ANYTLS_SERVICE_NAME}" 2>/dev/null | sed -n '1,8p' || true
 }
 
 anytls_start() {
     require_root
-    anytls_is_installed || die "AnyTLS is not installed."
+    anytls_is_installed || { warn "AnyTLS is not installed."; return 0; }
     systemctl start "${ANYTLS_SERVICE_NAME}"
     anytls_status
 }
 
 anytls_stop() {
     require_root
-    anytls_is_installed || die "AnyTLS is not installed."
+    anytls_is_installed || { warn "AnyTLS is not installed."; return 0; }
     systemctl stop "${ANYTLS_SERVICE_NAME}"
     anytls_status
 }
@@ -1798,16 +2739,19 @@ anytls_menu() {
         echo -e "${CYAN}============================================${RESET}"
         echo -e "${CYAN}        AnyTLS Manager${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo "1. Install / reinstall AnyTLS"
-        echo "2. Update AnyTLS"
-        echo "3. Show client config"
-        echo "4. Change port"
-        echo "5. Change password"
-        echo "6. Show service status"
-        echo "7. HTTP-01 certificate + secure AnyTLS (requires port 80)"
-        echo "8. Cloudflare DNS certificate + secure AnyTLS (no port 80)"
-        echo "9. Apply existing Let's Encrypt cert to AnyTLS"
-        echo "10. Renew certificate"
+        echo "-- TLS mode 1: self-signed (no domain needed) --"
+        echo "1. Install / reinstall with a self-signed certificate"
+        echo "-- TLS mode 2: real certificate for your domain --"
+        echo "2. Issue via HTTP-01 (needs port 80 + DNS pointing here)"
+        echo "3. Issue via Cloudflare DNS-01 (no port 80 needed)"
+        echo "4. Use a certificate already issued on this server"
+        echo "5. Renew certificates now"
+        echo "-- Management --"
+        echo "6. Update sing-box (keeps port, password, certificate)"
+        echo "7. Show client config"
+        echo "8. Change port"
+        echo "9. Change password"
+        echo "10. Show service status"
         echo "11. Start service"
         echo "12. Stop service"
         echo "13. Show logs"
@@ -1816,16 +2760,16 @@ anytls_menu() {
         echo -e "${CYAN}============================================${RESET}"
         read -rp "Select [0-14]: " choice
         case "${choice}" in
-            1) anytls_install ;;
-            2) anytls_update ;;
-            3) anytls_client_export ;;
-            4) anytls_change_port ;;
-            5) anytls_change_password ;;
-            6) anytls_status ;;
-            7) anytls_install_with_acme_cert ;;
-            8) anytls_install_with_cloudflare_cert ;;
-            9) anytls_apply_existing_cert ;;
-            10) renew_anytls_certificate ;;
+            1) anytls_install_self_signed || true ;;
+            2) anytls_install_with_acme_cert || true ;;
+            3) anytls_install_with_cloudflare_cert || true ;;
+            4) anytls_apply_existing_cert || true ;;
+            5) renew_anytls_certificate || true ;;
+            6) anytls_update || true ;;
+            7) anytls_client_export || true ;;
+            8) anytls_change_value port || true ;;
+            9) anytls_change_value password || true ;;
+            10) anytls_status ;;
             11) anytls_start ;;
             12) anytls_stop ;;
             13) anytls_logs ;;
@@ -1838,14 +2782,24 @@ anytls_menu() {
     done
 }
 
+# ===========================================================================
+# VLESS + Reality (sing-box)
+#
+# Reality has no relationship with the operator's own domain or certificate.
+# It borrows the TLS handshake of an unrelated third-party site, so this
+# module never touches ACME/certbot and never asks for a domain that must
+# resolve to this server.
+# ===========================================================================
+
 vless_prompt_port() {
     local input
 
     while true; do
-        echo "Press Enter for a random available port, or enter a custom port [1-65535] (443 is common for Reality)." >&2
-        read -rp "VLESS+Reality port: " input
+        echo "Press Enter for a random available port, or enter a custom port [1-65535]." >&2
+        read -rp "VLESS+Reality listen port: " input
         if [ -z "${input:-}" ]; then
             input="$(random_available_port)"
+            echo "Using random port: ${input}" >&2
         fi
         if ! valid_port "${input}"; then
             err "Invalid port: ${input}"
@@ -1855,107 +2809,148 @@ vless_prompt_port() {
             err "Port ${input} is already in use."
             continue
         fi
-        echo "${input}"
+        printf '%s' "${input}"
         return 0
     done
 }
 
+# Reality handshake target ("masquerade site"). Deliberately NOT called a
+# domain prompt: it must be a third-party site, never the user's own domain.
 vless_prompt_sni() {
     local choice
     local domain
+    local current="${1:-}"
+    local i
+    local candidate
+    local list=()
+
+    while IFS= read -r candidate; do
+        [ -n "${candidate}" ] && list+=("${candidate}")
+    done <<EOF
+${VLESS_SNI_CANDIDATES}
+EOF
 
     while true; do
-        echo >&2
-        info "Choose a Reality handshake target domain (a real TLS 1.3 site not blocked in your region):" >&2
-        echo "1. www.microsoft.com (default)" >&2
-        echo "2. www.bing.com" >&2
-        echo "3. addons.mozilla.org" >&2
-        echo "4. itunes.apple.com" >&2
-        echo "5. Enter a custom domain" >&2
-        read -rp "Select [1-5, Enter = default]: " choice
-        case "${choice}" in
-            ""|1) domain="www.microsoft.com"; break ;;
-            2) domain="www.bing.com"; break ;;
-            3) domain="addons.mozilla.org"; break ;;
-            4) domain="itunes.apple.com"; break ;;
-            5)
-                read -rp "Custom domain: " domain
-                [ -n "${domain}" ] && break
-                err "Domain is required."
-                ;;
-            *) err "Please enter 1-5." ;;
-        esac
+        {
+            echo
+            info "Reality masquerade site (TLS handshake target)"
+            echo "This is a well-known third-party HTTPS site that Reality impersonates."
+            echo "It is NOT your domain, needs no DNS record pointing here, and needs no certificate."
+            echo "Pick one that is reachable and not blocked from your server's region."
+            echo
+            for i in "${!list[@]}"; do
+                if [ "${list[$i]}" = "${VLESS_DEFAULT_SNI}" ]; then
+                    echo "$((i + 1)). ${list[$i]} (default)"
+                else
+                    echo "$((i + 1)). ${list[$i]}"
+                fi
+            done
+            echo "$(( ${#list[@]} + 1 )). Enter another third-party site manually"
+            [ -n "${current}" ] && echo "Current value: ${current}"
+        } >&2
+
+        read -rp "Select [1-$(( ${#list[@]} + 1 )), Enter = ${VLESS_DEFAULT_SNI}]: " choice
+
+        if [ -z "${choice}" ]; then
+            printf '%s' "${VLESS_DEFAULT_SNI}"
+            return 0
+        fi
+
+        if [[ "${choice}" =~ ^[0-9]+$ ]] && [ "${choice}" -ge 1 ] && [ "${choice}" -le "${#list[@]}" ]; then
+            printf '%s' "${list[$((choice - 1))]}"
+            return 0
+        fi
+
+        if [ "${choice}" = "$(( ${#list[@]} + 1 ))" ]; then
+            read -rp "Third-party site hostname (e.g. www.example.com): " domain
+            if ! is_valid_domain "${domain}"; then
+                err "Not a valid hostname: ${domain}"
+                continue
+            fi
+            warn "Make sure ${domain} is a real TLS 1.3 site that does NOT resolve to this server."
+            printf '%s' "${domain}"
+            return 0
+        fi
+
+        err "Please choose a listed option."
     done
-
-    echo "${domain}"
 }
 
-vless_uuid() {
+vless_gen_uuid() {
+    local value=""
+
     if [ -x "${VLESS_SING_BOX_BIN}" ]; then
-        "${VLESS_SING_BOX_BIN}" generate uuid 2>/dev/null && return 0
+        value="$("${VLESS_SING_BOX_BIN}" generate uuid 2>/dev/null | tr -d '[:space:]' || true)"
     fi
-    if has_command uuidgen; then
-        uuidgen
-    elif [ -r /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
-    else
-        random_psk
+    if [ -z "${value}" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+        value="$(tr -d '[:space:]' < /proc/sys/kernel/random/uuid)"
     fi
+    if [ -z "${value}" ] && has_command uuidgen; then
+        value="$(uuidgen | tr -d '[:space:]')"
+    fi
+
+    if ! [[ "${value}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        fail_step "UUID generation" "Could not produce a valid UUID." \
+            "- Ensure /proc/sys/kernel/random/uuid is readable or install uuid-runtime."
+        return 1
+    fi
+    printf '%s' "${value}"
 }
 
-vless_generate_reality_keypair() {
+# Reality short ID: hex, even length, 1..16 chars. openssl is the primary
+# source so this never depends on sing-box CLI argument ordering.
+vless_gen_short_id() {
+    local value=""
+
+    if has_command openssl; then
+        value="$(openssl rand -hex 4 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    if [ -z "${value}" ] && [ -x "${VLESS_SING_BOX_BIN}" ]; then
+        value="$("${VLESS_SING_BOX_BIN}" generate rand --hex 4 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    if [ -z "${value}" ] && [ -r /dev/urandom ]; then
+        value="$(tr -dc 'a-f0-9' </dev/urandom | head -c 8)"
+    fi
+
+    if ! [[ "${value}" =~ ^([0-9a-f]{2}){1,8}$ ]]; then
+        fail_step "Reality short ID generation" "Could not produce a valid hex short ID." \
+            "- Ensure openssl is installed."
+        return 1
+    fi
+    printf '%s' "${value}"
+}
+
+# Returns "private|public". Handles both "PrivateKey: x" and "PrivateKey x".
+vless_gen_reality_keypair() {
     local output
     local priv
     local pub
 
-    [ -x "${VLESS_SING_BOX_BIN}" ] || die "sing-box binary not found. Install VLESS+Reality first."
-
-    output="$("${VLESS_SING_BOX_BIN}" generate reality-keypair 2>/dev/null)"
-    [ -n "${output}" ] || die "Failed to generate Reality key pair."
-
-    priv="$(printf '%s\n' "${output}" | sed -nE 's/^PrivateKey:[[:space:]]*(.*)$/\1/p' | head -n1)"
-    pub="$(printf '%s\n' "${output}" | sed -nE 's/^PublicKey:[[:space:]]*(.*)$/\1/p' | head -n1)"
-    [ -n "${priv}" ] && [ -n "${pub}" ] || die "Failed to parse Reality key pair output."
-
-    echo "${priv}|${pub}"
-}
-
-vless_short_id() {
-    if [ -x "${VLESS_SING_BOX_BIN}" ]; then
-        "${VLESS_SING_BOX_BIN}" generate rand 8 --hex 2>/dev/null && return 0
+    if [ ! -x "${VLESS_SING_BOX_BIN}" ]; then
+        fail_step "Reality key generation" "sing-box binary not present at ${VLESS_SING_BOX_BIN}."
+        return 1
     fi
-    if has_command openssl; then
-        openssl rand -hex 8
-    else
-        tr -dc 'a-f0-9' </dev/urandom | head -c 16
+
+    if ! output="$("${VLESS_SING_BOX_BIN}" generate reality-keypair 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        fail_step "Reality key generation" "sing-box generate reality-keypair failed." \
+            "- The sing-box binary may be incomplete; reinstall it." \
+            "${VLESS_SING_BOX_BIN} generate reality-keypair"
+        return 1
     fi
-}
 
-vless_param() {
-    local key="$1"
+    priv="$(printf '%s\n' "${output}" | awk '/PrivateKey/ {print $NF}' | tr -d '"[:space:]' | head -n1)"
+    pub="$(printf '%s\n' "${output}" | awk '/PublicKey/ {print $NF}' | tr -d '"[:space:]' | head -n1)"
 
-    [ -f "${VLESS_PARAMS_FILE}" ] || return 0
-    grep -E "^${key}=" "${VLESS_PARAMS_FILE}" | tail -n1 | cut -d= -f2-
-}
+    if [ -z "${priv}" ] || [ -z "${pub}" ]; then
+        printf '%s\n' "${output}" >&2
+        fail_step "Reality key generation" "Could not parse the key pair output shown above." \
+            "- The sing-box CLI output format may have changed." \
+            "${VLESS_SING_BOX_BIN} generate reality-keypair"
+        return 1
+    fi
 
-write_vless_params() {
-    local port="$1"
-    local uuid="$2"
-    local sni="$3"
-    local priv="$4"
-    local pub="$5"
-    local sid="$6"
-
-    mkdir -p "${VLESS_DIR}"
-    cat > "${VLESS_PARAMS_FILE}" <<EOF
-PORT=${port}
-UUID=${uuid}
-SNI=${sni}
-PRIVATE_KEY=${priv}
-PUBLIC_KEY=${pub}
-SHORT_ID=${sid}
-EOF
-    chmod 600 "${VLESS_PARAMS_FILE}"
+    printf '%s|%s' "${priv}" "${pub}"
 }
 
 write_vless_config() {
@@ -1966,6 +2961,8 @@ write_vless_config() {
     local sid="$5"
 
     mkdir -p "${VLESS_DIR}"
+    chmod 700 "${VLESS_DIR}"
+
     cat > "${VLESS_CONFIG}" <<EOF
 {
   "log": {
@@ -1980,6 +2977,7 @@ write_vless_config() {
       "listen_port": ${port},
       "users": [
         {
+          "name": "main",
           "uuid": "${uuid}",
           "flow": "xtls-rprx-vision"
         }
@@ -2010,10 +3008,55 @@ EOF
     chmod 600 "${VLESS_CONFIG}"
 }
 
+vless_save_public_key() {
+    mkdir -p "${VLESS_DIR}"
+    printf '%s\n' "$1" > "${VLESS_PUBKEY_FILE}"
+    chmod 600 "${VLESS_PUBKEY_FILE}"
+}
+
+# Earlier versions of this script kept every Reality value in params.conf.
+# The public key is the only one that cannot be recomputed, so recover it
+# into its own file instead of declaring those installs broken.
+vless_migrate_legacy_params() {
+    local pub
+
+    [ -s "${VLESS_PUBKEY_FILE}" ] && return 0
+    [ -f "${VLESS_PARAMS_FILE}" ] || return 0
+
+    pub="$(grep -E '^PUBLIC_KEY=' "${VLESS_PARAMS_FILE}" | tail -n1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+    [ -n "${pub}" ] || return 0
+
+    vless_save_public_key "${pub}"
+    ok "Recovered the Reality public key from ${VLESS_PARAMS_FILE} into ${VLESS_PUBKEY_FILE}"
+    return 0
+}
+
+# ---- read-back accessors: the on-disk JSON is the single source of truth ----
+
+vless_cfg_get() {
+    local filter="$1"
+    local value
+
+    [ -s "${VLESS_CONFIG}" ] || return 1
+    value="$(jq -r "${filter}" "${VLESS_CONFIG}" 2>/dev/null || true)"
+    [ -n "${value}" ] && [ "${value}" != "null" ] || return 1
+    printf '%s' "${value}"
+}
+
+vless_cfg_port()  { vless_cfg_get '.inbounds[0].listen_port'; }
+vless_cfg_uuid()  { vless_cfg_get '.inbounds[0].users[0].uuid'; }
+vless_cfg_sni()   { vless_cfg_get '.inbounds[0].tls.server_name'; }
+vless_cfg_sid()   { vless_cfg_get '.inbounds[0].tls.reality.short_id[0]'; }
+vless_cfg_priv()  { vless_cfg_get '.inbounds[0].tls.reality.private_key'; }
+vless_cfg_pubkey() {
+    [ -s "${VLESS_PUBKEY_FILE}" ] || vless_migrate_legacy_params >/dev/null 2>&1 || true
+    [ -s "${VLESS_PUBKEY_FILE}" ] || return 1
+    tr -d '[:space:]' < "${VLESS_PUBKEY_FILE}"
+}
+
 vless_installed_version() {
-    if [ -f "${VLESS_SERVICE_FILE}" ]; then
-        grep '^X-VLESS-Version=' "${VLESS_SERVICE_FILE}" | sed -E 's/^X-VLESS-Version=//' || true
-    fi
+    [ -f "${VLESS_SERVICE_FILE}" ] || return 0
+    grep '^X-VLESS-Version=' "${VLESS_SERVICE_FILE}" | sed -E 's/^X-VLESS-Version=//' || true
 }
 
 write_vless_service() {
@@ -2049,280 +3092,346 @@ EOF
 }
 
 vless_is_installed() {
-    [ -x "${VLESS_SING_BOX_BIN}" ] || [ -f "${VLESS_SERVICE_FILE}" ]
+    [ -x "${VLESS_SING_BOX_BIN}" ] || [ -f "${VLESS_SERVICE_FILE}" ] || [ -s "${VLESS_CONFIG}" ]
 }
 
 vless_is_active() {
-    systemctl is-active "${VLESS_SERVICE_NAME}" >/dev/null 2>&1
+    service_is_active "${VLESS_SERVICE_NAME}"
 }
 
-vless_restart() {
-    systemctl daemon-reload
-    systemctl enable "${VLESS_SERVICE_NAME}" >/dev/null
-    systemctl restart "${VLESS_SERVICE_NAME}"
-    systemctl --no-pager --full status "${VLESS_SERVICE_NAME}" | sed -n '1,8p' || true
+# Classifies the install so each menu action can react instead of blindly
+# overwriting: not_installed | ok | binary_missing | service_missing |
+# config_broken
+vless_state() {
+    if ! vless_is_installed; then
+        echo "not_installed"
+        return 0
+    fi
+    vless_migrate_legacy_params >/dev/null 2>&1 || true
+    if [ ! -s "${VLESS_CONFIG}" ]; then
+        echo "config_broken"
+        return 0
+    fi
+    if ! jq -e '.inbounds[0].tls.reality.private_key' "${VLESS_CONFIG}" >/dev/null 2>&1; then
+        echo "config_broken"
+        return 0
+    fi
+    if [ ! -s "${VLESS_PUBKEY_FILE}" ]; then
+        echo "config_broken"
+        return 0
+    fi
+    if [ ! -x "${VLESS_SING_BOX_BIN}" ]; then
+        echo "binary_missing"
+        return 0
+    fi
+    if [ ! -f "${VLESS_SERVICE_FILE}" ]; then
+        echo "service_missing"
+        return 0
+    fi
+    echo "ok"
 }
 
+vless_backup_existing() {
+    backup_file "${VLESS_CONFIG}"
+    backup_file "${VLESS_PUBKEY_FILE}"
+}
+
+# Builds the share link strictly from the values sing-box will actually serve.
 vless_client_export() {
-    local port
-    local uuid
-    local sni
-    local pub
-    local sid
-    local ip
-    local alias_enc
-    local link
-    local link_enc
+    local port uuid sni pub sid host alias_enc link link_enc
 
-    [ -f "${VLESS_PARAMS_FILE}" ] || die "VLESS+Reality config not found: ${VLESS_PARAMS_FILE}"
+    if [ ! -s "${VLESS_CONFIG}" ]; then
+        err "VLESS+Reality config not found: ${VLESS_CONFIG}"
+        return 1
+    fi
 
-    port="$(vless_param PORT)"
-    uuid="$(vless_param UUID)"
-    sni="$(vless_param SNI)"
-    pub="$(vless_param PUBLIC_KEY)"
-    sid="$(vless_param SHORT_ID)"
-    ip="$(anytls_public_ip)"
-    ip="${ip:-YOUR_SERVER_IP}"
+    port="$(vless_cfg_port)" || { err "Could not read listen_port from ${VLESS_CONFIG}"; return 1; }
+    uuid="$(vless_cfg_uuid)" || { err "Could not read uuid from ${VLESS_CONFIG}"; return 1; }
+    sni="$(vless_cfg_sni)"   || { err "Could not read server_name from ${VLESS_CONFIG}"; return 1; }
+    sid="$(vless_cfg_sid)"   || { err "Could not read short_id from ${VLESS_CONFIG}"; return 1; }
+    if ! pub="$(vless_cfg_pubkey)"; then
+        err "Reality public key file is missing: ${VLESS_PUBKEY_FILE}"
+        err "The public key cannot be recovered from the config. Regenerate keys from the VLESS menu."
+        return 1
+    fi
+
+    host="$(client_endpoint_host)"
     alias_enc="$(urlencode "${VLESS_ALIAS}")"
-    link="vless://${uuid}@${ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${alias_enc}"
+    link="vless://${uuid}@${host}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#${alias_enc}"
     link_enc="$(urlencode "${link}")"
 
     mkdir -p "${VLESS_DIR}"
     cat > "${VLESS_CLIENT_FILE}" <<EOF
 VLESS + Reality client parameters
-Address: ${ip}
+(read back from ${VLESS_CONFIG})
+Address: ${host}
 Port: ${port}
 UUID: ${uuid}
 Flow: xtls-rprx-vision
 Encryption: none
 Security: reality
-SNI (server_name): ${sni}
+SNI / server name: ${sni}
 Fingerprint: chrome
-Public key: ${pub}
+Reality public key: ${pub}
 Short ID: ${sid}
 Network: tcp
 URL: ${link}
 QR: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${link_enc}
 EOF
+    chmod 600 "${VLESS_CLIENT_FILE}"
 
     echo
     ok "VLESS + Reality client parameters"
     cat "${VLESS_CLIENT_FILE}"
+    return 0
+}
+
+# Confirms the share link matches the running config field by field.
+vless_verify_client_match() {
+    local port uuid sni sid pub mismatch=0
+
+    port="$(vless_cfg_port)" || return 1
+    uuid="$(vless_cfg_uuid)" || return 1
+    sni="$(vless_cfg_sni)" || return 1
+    sid="$(vless_cfg_sid)" || return 1
+    pub="$(vless_cfg_pubkey)" || return 1
+
+    [ -s "${VLESS_CLIENT_FILE}" ] || return 1
+
+    grep -q "sni=${sni}&" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q "pbk=${pub}&" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q "sid=${sid}&" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q "${uuid}@" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q ":${port}?" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q "flow=xtls-rprx-vision" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q "security=reality" "${VLESS_CLIENT_FILE}" || mismatch=1
+    grep -q "type=tcp" "${VLESS_CLIENT_FILE}" || mismatch=1
+
+    if [ "${mismatch}" -ne 0 ]; then
+        warn "Client link does not match the server config; regenerate it from the VLESS menu."
+        return 1
+    fi
+    ok "Client link matches the server config (uuid, port, sni, pbk, sid, flow, security, type)."
+    return 0
+}
+
+# Writes config + unit, validates, starts, verifies, then exports the link.
+# Any failure aborts before "success" is printed.
+vless_apply() {
+    local port="$1" uuid="$2" sni="$3" priv="$4" pub="$5" sid="$6" version="$7"
+
+    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
+    vless_save_public_key "${pub}"
+    write_vless_service "${version}"
+
+    sing_box_check_config "${VLESS_SING_BOX_BIN}" "${VLESS_CONFIG}" "VLESS+Reality" || return 1
+    activate_and_verify "${VLESS_SERVICE_NAME}" "${port}" "VLESS+Reality" || return 1
+
+    ok "VLESS+Reality is running on port ${port}."
+    vless_client_export || return 1
+    vless_verify_client_match || true
+    return 0
 }
 
 vless_install() {
-    local port
-    local uuid
-    local sni
-    local keys
-    local priv
-    local pub
-    local sid
-    local version
+    local state choice
+    local port uuid sni keys priv pub sid version
 
-    require_root
+    preflight_common "VLESS+Reality" || return 1
 
-    install_sing_box_binary "${VLESS_SING_BOX_BIN}"
+    state="$(vless_state)"
+    if [ "${state}" != "not_installed" ]; then
+        echo
+        warn "VLESS+Reality is already present (state: ${state})."
+        echo "1. Keep the existing UUID, port, keys and SNI; only reinstall the binary and service"
+        echo "2. Back up the current config, then generate a completely new one"
+        echo "3. Show the current client config"
+        echo "0. Cancel"
+        read -rp "Select [0-3]: " choice
+        case "${choice}" in
+            1) vless_repair; return $? ;;
+            2) vless_backup_existing ;;
+            3) vless_client_export; return $? ;;
+            *) info "Cancelled."; return 0 ;;
+        esac
+    fi
+
+    install_sing_box_binary "${VLESS_SING_BOX_BIN}" || return 1
     version="${SING_BOX_DOWNLOADED_VERSION}"
 
     port="$(vless_prompt_port)"
     sni="$(vless_prompt_sni)"
-    uuid="$(vless_uuid)"
-    keys="$(vless_generate_reality_keypair)"
+    uuid="$(vless_gen_uuid)" || return 1
+    keys="$(vless_gen_reality_keypair)" || return 1
     priv="${keys%%|*}"
     pub="${keys#*|}"
-    sid="$(vless_short_id)"
+    sid="$(vless_gen_short_id)" || return 1
 
-    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
-    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
-    write_vless_service "${version}"
-    vless_restart
+    vless_apply "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}" "${version}"
+}
 
-    if vless_is_active; then
-        ok "VLESS+Reality is installed and running."
-        vless_client_export
-    else
-        warn "VLESS+Reality did not become active. Check: journalctl -u ${VLESS_SERVICE_NAME} -e"
+# Rebuilds binary/unit while preserving every client-visible value.
+vless_repair() {
+    local port uuid sni priv pub sid version
+
+    preflight_common "VLESS+Reality" || return 1
+
+    if [ ! -s "${VLESS_CONFIG}" ]; then
+        fail_step "VLESS+Reality repair" "No usable config at ${VLESS_CONFIG}" \
+            "- Run 'Install / reinstall' and choose to generate a new config."
+        return 1
     fi
+
+    port="$(vless_cfg_port)" || { fail_step "VLESS+Reality repair" "listen_port missing from config."; return 1; }
+    uuid="$(vless_cfg_uuid)" || { fail_step "VLESS+Reality repair" "uuid missing from config."; return 1; }
+    sni="$(vless_cfg_sni)" || { fail_step "VLESS+Reality repair" "server_name missing from config."; return 1; }
+    priv="$(vless_cfg_priv)" || { fail_step "VLESS+Reality repair" "private_key missing from config."; return 1; }
+    sid="$(vless_cfg_sid)" || { fail_step "VLESS+Reality repair" "short_id missing from config."; return 1; }
+    if ! pub="$(vless_cfg_pubkey)"; then
+        fail_step "VLESS+Reality repair" \
+            "Reality public key file ${VLESS_PUBKEY_FILE} is missing." \
+            "- The public key cannot be derived from the stored private key.
+- Use 'Regenerate Reality key pair' to create a fresh pair (clients must be updated)."
+        return 1
+    fi
+
+    install_sing_box_binary "${VLESS_SING_BOX_BIN}" || return 1
+    version="${SING_BOX_DOWNLOADED_VERSION}"
+
+    vless_apply "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}" "${version}"
 }
 
 vless_update() {
-    local port
-    local uuid
-    local sni
-    local priv
-    local pub
-    local sid
-    local version
+    preflight_common "VLESS+Reality" || return 1
 
-    require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
+    if ! vless_is_installed; then
+        fail_step "VLESS+Reality update" "VLESS+Reality is not installed." \
+            "- Use 'Install / reinstall' first."
+        return 1
+    fi
 
-    port="$(vless_param PORT)"
-    uuid="$(vless_param UUID)"
-    sni="$(vless_param SNI)"
-    priv="$(vless_param PRIVATE_KEY)"
-    pub="$(vless_param PUBLIC_KEY)"
-    sid="$(vless_param SHORT_ID)"
-    [ -n "${port}" ] && [ -n "${uuid}" ] && [ -n "${sni}" ] && [ -n "${priv}" ] && [ -n "${sid}" ] || \
-        die "Existing VLESS+Reality parameters are incomplete. Reinstall instead."
+    info "Updating sing-box while keeping the existing UUID, port, keys and SNI."
+    vless_repair
+}
 
-    install_sing_box_binary "${VLESS_SING_BOX_BIN}"
-    version="${SING_BOX_DOWNLOADED_VERSION}"
+# Shared path for the change-one-value actions.
+vless_change_value() {
+    local field="$1"
+    local port uuid sni priv pub sid
 
-    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
-    write_vless_service "${version}"
-    vless_restart
-    ok "VLESS+Reality binary update completed."
-    vless_client_export
+    preflight_common "VLESS+Reality" || return 1
+
+    if [ ! -s "${VLESS_CONFIG}" ] || [ ! -x "${VLESS_SING_BOX_BIN}" ]; then
+        fail_step "VLESS+Reality change ${field}" "VLESS+Reality is not fully installed." \
+            "- Run 'Install / reinstall' first."
+        return 1
+    fi
+
+    port="$(vless_cfg_port)" || return 1
+    uuid="$(vless_cfg_uuid)" || return 1
+    sni="$(vless_cfg_sni)" || return 1
+    priv="$(vless_cfg_priv)" || return 1
+    sid="$(vless_cfg_sid)" || return 1
+    pub="$(vless_cfg_pubkey)" || {
+        fail_step "VLESS+Reality change ${field}" "Public key file missing: ${VLESS_PUBKEY_FILE}" \
+            "- Use 'Regenerate Reality key pair' instead."
+        return 1
+    }
+
+    case "${field}" in
+        port)
+            port="$(vless_prompt_port)"
+            ;;
+        uuid)
+            uuid="$(vless_gen_uuid)" || return 1
+            info "New UUID: ${uuid}"
+            ;;
+        sni)
+            sni="$(vless_prompt_sni "${sni}")"
+            ;;
+        keys)
+            local keys
+            keys="$(vless_gen_reality_keypair)" || return 1
+            priv="${keys%%|*}"
+            pub="${keys#*|}"
+            sid="$(vless_gen_short_id)" || return 1
+            warn "Reality keys changed: every client must be reconfigured with the new pbk/sid."
+            ;;
+        *)
+            fail_step "VLESS+Reality change" "Unknown field: ${field}"
+            return 1
+            ;;
+    esac
+
+    vless_backup_existing
+    vless_apply "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}" ""
 }
 
 vless_uninstall() {
     local confirm
 
     require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
+    if ! vless_is_installed; then
+        warn "VLESS+Reality is not installed."
+        return 0
+    fi
 
-    read -rp "Uninstall VLESS+Reality and delete ${VLESS_DIR}? [y/N]: " confirm
+    warn "This removes only files created by this module:"
+    echo "  ${VLESS_DIR}"
+    echo "  ${VLESS_SERVICE_FILE}"
+    read -rp "Uninstall VLESS+Reality? [y/N]: " confirm
     [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
 
     systemctl disable --now "${VLESS_SERVICE_NAME}" 2>/dev/null || true
     rm -f "${VLESS_SERVICE_FILE}"
     rm -rf "${VLESS_DIR}"
     systemctl daemon-reload 2>/dev/null || true
-    ok "VLESS+Reality uninstalled."
-}
-
-vless_change_port() {
-    local port
-    local uuid
-    local sni
-    local priv
-    local pub
-    local sid
-
-    require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
-
-    port="$(vless_prompt_port)"
-    uuid="$(vless_param UUID)"
-    sni="$(vless_param SNI)"
-    priv="$(vless_param PRIVATE_KEY)"
-    pub="$(vless_param PUBLIC_KEY)"
-    sid="$(vless_param SHORT_ID)"
-
-    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
-    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
-    write_vless_service ""
-    vless_restart
-    vless_client_export
-}
-
-vless_change_uuid() {
-    local port
-    local uuid
-    local sni
-    local priv
-    local pub
-    local sid
-
-    require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
-
-    port="$(vless_param PORT)"
-    uuid="$(vless_uuid)"
-    sni="$(vless_param SNI)"
-    priv="$(vless_param PRIVATE_KEY)"
-    pub="$(vless_param PUBLIC_KEY)"
-    sid="$(vless_param SHORT_ID)"
-
-    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
-    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
-    write_vless_service ""
-    vless_restart
-    vless_client_export
-}
-
-vless_change_sni() {
-    local port
-    local uuid
-    local sni
-    local priv
-    local pub
-    local sid
-
-    require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
-
-    port="$(vless_param PORT)"
-    uuid="$(vless_param UUID)"
-    sni="$(vless_prompt_sni)"
-    priv="$(vless_param PRIVATE_KEY)"
-    pub="$(vless_param PUBLIC_KEY)"
-    sid="$(vless_param SHORT_ID)"
-
-    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
-    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
-    write_vless_service ""
-    vless_restart
-    vless_client_export
-}
-
-vless_regenerate_keys() {
-    local port
-    local uuid
-    local sni
-    local keys
-    local priv
-    local pub
-    local sid
-
-    require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
-
-    port="$(vless_param PORT)"
-    uuid="$(vless_param UUID)"
-    sni="$(vless_param SNI)"
-    keys="$(vless_generate_reality_keypair)"
-    priv="${keys%%|*}"
-    pub="${keys#*|}"
-    sid="$(vless_short_id)"
-
-    write_vless_params "${port}" "${uuid}" "${sni}" "${priv}" "${pub}" "${sid}"
-    write_vless_config "${port}" "${uuid}" "${sni}" "${priv}" "${sid}"
-    write_vless_service ""
-    vless_restart
-    vless_client_export
+    ok "VLESS+Reality uninstalled. Snell and AnyTLS were not touched."
 }
 
 vless_status() {
-    if vless_is_installed; then
-        echo
-        ok "VLESS+Reality installed"
-        echo "Version: $(vless_installed_version)"
-        echo "Port: $(vless_param PORT)"
-        echo "SNI: $(vless_param SNI)"
-        if vless_is_active; then
-            echo "Status: running"
-        else
-            echo "Status: stopped"
-        fi
-        systemctl --no-pager --full status "${VLESS_SERVICE_NAME}" | sed -n '1,8p' || true
-    else
+    local port
+
+    if ! vless_is_installed; then
         warn "VLESS+Reality is not installed."
+        return 0
     fi
+
+    echo
+    ok "VLESS+Reality"
+    echo "State: $(vless_state)"
+    echo "sing-box version: $(vless_installed_version)"
+    echo "Port: $(vless_cfg_port 2>/dev/null || echo unknown)"
+    echo "Masquerade SNI: $(vless_cfg_sni 2>/dev/null || echo unknown)"
+
+    if vless_is_active; then
+        echo "Service: running"
+    else
+        echo "Service: stopped"
+    fi
+
+    port="$(vless_cfg_port 2>/dev/null || true)"
+    if [ -n "${port}" ]; then
+        if port_is_listening "${port}" 1; then
+            echo "Listener: port ${port} is listening"
+        else
+            warn "Listener: nothing is listening on port ${port}"
+        fi
+    fi
+
+    systemctl --no-pager --full status "${VLESS_SERVICE_NAME}" 2>/dev/null | sed -n '1,8p' || true
 }
 
 vless_start() {
     require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
+    vless_is_installed || { warn "VLESS+Reality is not installed."; return 0; }
     systemctl start "${VLESS_SERVICE_NAME}"
     vless_status
 }
 
 vless_stop() {
     require_root
-    vless_is_installed || die "VLESS+Reality is not installed."
+    vless_is_installed || { warn "VLESS+Reality is not installed."; return 0; }
     systemctl stop "${VLESS_SERVICE_NAME}"
     vless_status
 }
@@ -2338,35 +3447,38 @@ vless_menu() {
         clear
         echo -e "${CYAN}============================================${RESET}"
         echo -e "${CYAN}        VLESS + Reality Manager${RESET}"
+        echo -e "${CYAN}   No domain, no certificate, no port 80${RESET}"
         echo -e "${CYAN}============================================${RESET}"
         echo "1. Install / reinstall VLESS+Reality"
-        echo "2. Update sing-box binary"
+        echo "2. Update sing-box (keeps UUID, port, keys, SNI)"
         echo "3. Show client config"
         echo "4. Change port"
         echo "5. Change UUID"
-        echo "6. Change Reality handshake domain (SNI)"
+        echo "6. Change masquerade SNI (handshake target)"
         echo "7. Regenerate Reality key pair + short ID"
-        echo "8. Show service status"
-        echo "9. Start service"
-        echo "10. Stop service"
-        echo "11. Show logs"
-        echo "12. Uninstall VLESS+Reality"
+        echo "8. Repair install (rebuild binary/service, keep settings)"
+        echo "9. Show service status"
+        echo "10. Start service"
+        echo "11. Stop service"
+        echo "12. Show logs"
+        echo "13. Uninstall VLESS+Reality"
         echo "0. Back"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-12]: " choice
+        read -rp "Select [0-13]: " choice
         case "${choice}" in
-            1) vless_install ;;
-            2) vless_update ;;
-            3) vless_client_export ;;
-            4) vless_change_port ;;
-            5) vless_change_uuid ;;
-            6) vless_change_sni ;;
-            7) vless_regenerate_keys ;;
-            8) vless_status ;;
-            9) vless_start ;;
-            10) vless_stop ;;
-            11) vless_logs ;;
-            12) vless_uninstall ;;
+            1) vless_install || true ;;
+            2) vless_update || true ;;
+            3) vless_client_export || true ;;
+            4) vless_change_value port || true ;;
+            5) vless_change_value uuid || true ;;
+            6) vless_change_value sni || true ;;
+            7) vless_change_value keys || true ;;
+            8) vless_repair || true ;;
+            9) vless_status ;;
+            10) vless_start ;;
+            11) vless_stop ;;
+            12) vless_logs ;;
+            13) vless_uninstall ;;
             0) return 0 ;;
             *) err "Invalid option." ;;
         esac
@@ -2375,68 +3487,80 @@ vless_menu() {
     done
 }
 
-deploy_three_no_cert() {
-    require_root
-    info "Step 1/3: Snell installation"
-    install_snell
-    echo
-    info "Step 2/3: VLESS+Reality installation"
-    vless_install
-    echo
-    info "Step 3/3: AnyTLS installation (self-signed, no domain certificate)"
-    anytls_install
-}
-
-deploy_three_with_domain_cert() {
-    local method
+# Runs the three protocol installs in sequence. A failing module is reported
+# and recorded, but does not abort the remaining protocols; the summary at the
+# end states exactly what succeeded and what did not.
+deploy_stack() {
+    local with_cert="$1"
+    local with_bbr="$2"
+    local method=""
+    local total=3
+    local step=0
+    local failed=()
 
     require_root
-    info "Step 1/3: Snell installation"
-    install_snell
+
+    [ "${with_bbr}" = "true" ] && total=4
+
+    if [ "${with_cert}" = "true" ]; then
+        echo
+        info "AnyTLS certificate method for this deployment:"
+        echo "1. Issue a new certificate via HTTP-01 (port 80 must be reachable)"
+        echo "2. Issue a new certificate via Cloudflare DNS-01 (port 80 not required)"
+        echo "3. Use a certificate already issued on this server"
+        read -rp "Select certificate method [1-3]: " method
+        case "${method}" in
+            1|2|3) : ;;
+            *) err "Invalid option."; return 1 ;;
+        esac
+    fi
+
+    if [ "${with_bbr}" = "true" ]; then
+        step=$((step + 1))
+        info "Step ${step}/${total}: Enable BBR"
+        enable_bbr || failed+=("BBR")
+        echo
+    fi
+
+    step=$((step + 1))
+    info "Step ${step}/${total}: Snell"
+    install_snell || failed+=("Snell")
     echo
-    info "Step 2/3: VLESS+Reality installation"
-    warn "VLESS+Reality does not use your domain certificate by design: Reality borrows a real site's TLS handshake instead of presenting your own certificate."
-    vless_install
+
+    step=$((step + 1))
+    info "Step ${step}/${total}: VLESS+Reality"
+    info "Reality uses a third-party site's TLS handshake; it needs no domain and no certificate."
+    vless_install || failed+=("VLESS+Reality")
     echo
-    info "Step 3/3: AnyTLS installation using your domain certificate"
-    echo "1. Issue a new certificate via HTTP-01 (port 80 must be reachable)"
-    echo "2. Issue a new certificate via Cloudflare DNS-01 (port 80 not required)"
-    echo "3. Use an existing Let's Encrypt certificate already issued for a domain"
-    read -rp "Select certificate method [1-3]: " method
-    case "${method}" in
-        1) anytls_install_with_acme_cert ;;
-        2) anytls_install_with_cloudflare_cert ;;
-        3) anytls_apply_existing_cert ;;
-        *) err "Invalid option."; return 1 ;;
-    esac
+
+    step=$((step + 1))
+    if [ "${with_cert}" = "true" ]; then
+        info "Step ${step}/${total}: AnyTLS with your domain certificate"
+        case "${method}" in
+            1) anytls_install_with_acme_cert || failed+=("AnyTLS") ;;
+            2) anytls_install_with_cloudflare_cert || failed+=("AnyTLS") ;;
+            3) anytls_apply_existing_cert || failed+=("AnyTLS") ;;
+        esac
+    else
+        info "Step ${step}/${total}: AnyTLS with a self-signed certificate"
+        anytls_install_self_signed || failed+=("AnyTLS")
+    fi
+
+    echo
+    if [ "${#failed[@]}" -eq 0 ]; then
+        ok "All requested components completed successfully."
+        return 0
+    fi
+
+    err "Completed with failures in: ${failed[*]}"
+    warn "The other components were still installed. Re-run the individual menu"
+    warn "entry for each failed component to see its error again."
+    return 1
 }
 
-deploy_bbr_three_with_domain_cert() {
-    local method
-
-    require_root
-    info "Step 1/4: Enable BBR"
-    enable_bbr
-    echo
-    info "Step 2/4: Snell installation"
-    install_snell
-    echo
-    info "Step 3/4: VLESS+Reality installation"
-    warn "VLESS+Reality does not use your domain certificate by design: Reality borrows a real site's TLS handshake instead of presenting your own certificate."
-    vless_install
-    echo
-    info "Step 4/4: AnyTLS installation using your domain certificate"
-    echo "1. Issue a new certificate via HTTP-01 (port 80 must be reachable)"
-    echo "2. Issue a new certificate via Cloudflare DNS-01 (port 80 not required)"
-    echo "3. Use an existing Let's Encrypt certificate already issued for a domain"
-    read -rp "Select certificate method [1-3]: " method
-    case "${method}" in
-        1) anytls_install_with_acme_cert ;;
-        2) anytls_install_with_cloudflare_cert ;;
-        3) anytls_apply_existing_cert ;;
-        *) err "Invalid option."; return 1 ;;
-    esac
-}
+deploy_three_no_cert()            { deploy_stack "false" "false"; }
+deploy_three_with_domain_cert()   { deploy_stack "true"  "false"; }
+deploy_bbr_three_with_domain_cert() { deploy_stack "true" "true"; }
 
 restart_proxy_services() {
     require_root
@@ -2444,22 +3568,19 @@ restart_proxy_services() {
     info "Restarting Snell, VLESS+Reality, and AnyTLS services only. BBR will not be restarted or changed."
 
     if [ -f "${SERVICE_FILE}" ]; then
-        systemctl restart snell
-        ok "Snell service restarted."
+        activate_and_verify "snell" "$(snell_main_port)" "Snell" || true
     else
         warn "Snell service file not found; skipped."
     fi
 
     if [ -f "${VLESS_SERVICE_FILE}" ]; then
-        systemctl restart "${VLESS_SERVICE_NAME}"
-        ok "VLESS+Reality service restarted."
+        activate_and_verify "${VLESS_SERVICE_NAME}" "$(vless_cfg_port 2>/dev/null || true)" "VLESS+Reality" || true
     else
         warn "VLESS+Reality service file not found; skipped."
     fi
 
     if [ -f "${ANYTLS_SERVICE_FILE}" ]; then
-        systemctl restart "${ANYTLS_SERVICE_NAME}"
-        ok "AnyTLS service restarted."
+        activate_and_verify "${ANYTLS_SERVICE_NAME}" "$(anytls_cfg_port 2>/dev/null || true)" "AnyTLS" || true
     else
         warn "AnyTLS service file not found; skipped."
     fi
@@ -2536,16 +3657,21 @@ Security notes:
 - This script does not auto-update itself.
 - This script does not upload server information, config, ports, or PSKs.
 - Snell binaries are downloaded only from https://dl.nssurge.com/snell/.
-- AnyTLS binaries are downloaded only from https://github.com/anytls/anytls-go/releases.
-- VLESS+Reality and secure AnyTLS both run on official sing-box releases from https://github.com/SagerNet/sing-box/releases.
-- Reality mode does not use your own certificate: it borrows a real site's TLS handshake, so no domain or port 80 is required for VLESS+Reality.
+- VLESS+Reality and AnyTLS both run on official sing-box releases from https://github.com/SagerNet/sing-box/releases.
+- Reality never uses your own certificate: it borrows a third-party site's TLS
+  handshake, so VLESS+Reality needs no domain, no ACME and no port 80.
+- All certificate handling belongs to AnyTLS only. Installing Reality never
+  triggers certbot.
 - Cloudflare DNS certificates store the API token at /etc/letsencrypt/cloudflare.ini with chmod 600.
 - BBR is enabled locally through sysctl and modprobe only; no remote BBR script is used.
+- Uninstalling a module removes only that module's own files; /etc/letsencrypt
+  certificates and the other two protocols are left untouched.
 - Old script cleanup removes only legacy menu script files and shortcuts after confirmation.
 - Features from third-party scripts were reimplemented locally instead of being pasted as remote-execution code.
 - Do not publish /etc/snell/users/*.conf because those files contain PSKs.
-- Do not publish /etc/AnyTLS/config.yaml because it contains the AnyTLS password.
-- Do not publish /etc/vless-reality/params.conf or config.json because they contain your UUID and Reality private key.
+- Do not publish /etc/AnyTLS/config.json because it contains the AnyTLS password.
+- Do not publish /etc/vless-reality/config.json because it contains your UUID
+  and the Reality private key.
 EOF
 }
 
@@ -2564,8 +3690,8 @@ show_menu() {
     echo "6. Deploy Snell + VLESS-Reality + AnyTLS using your domain certificate (BBR unchanged)"
     echo "7. Enable BBR, then deploy Snell + VLESS-Reality + AnyTLS using your domain certificate"
     echo "8. Restart Snell + VLESS-Reality + AnyTLS services"
-    echo "9. HTTP-01 certificate + Secure AnyTLS only (requires port 80)"
-    echo "10. Cloudflare DNS certificate + Secure AnyTLS only (no port 80)"
+    echo "9. AnyTLS only: HTTP-01 certificate (requires port 80)"
+    echo "10. AnyTLS only: Cloudflare DNS certificate (no port 80)"
     echo "11. Show Snell config"
     echo "12. Show VLESS+Reality config"
     echo "13. Show AnyTLS config"
@@ -2591,16 +3717,16 @@ main() {
             1) snell_menu ;;
             2) vless_menu ;;
             3) anytls_menu ;;
-            4) enable_bbr ;;
-            5) deploy_three_no_cert ;;
-            6) deploy_three_with_domain_cert ;;
-            7) deploy_bbr_three_with_domain_cert ;;
-            8) restart_proxy_services ;;
-            9) anytls_install_with_acme_cert ;;
-            10) anytls_install_with_cloudflare_cert ;;
+            4) enable_bbr || true ;;
+            5) deploy_three_no_cert || true ;;
+            6) deploy_three_with_domain_cert || true ;;
+            7) deploy_bbr_three_with_domain_cert || true ;;
+            8) restart_proxy_services || true ;;
+            9) anytls_install_with_acme_cert || true ;;
+            10) anytls_install_with_cloudflare_cert || true ;;
             11) show_config ;;
-            12) vless_client_export ;;
-            13) anytls_client_export ;;
+            12) vless_client_export || true ;;
+            13) anytls_client_export || true ;;
             14) service_status ;;
             15) vless_status ;;
             16) anytls_status ;;
