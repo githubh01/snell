@@ -72,9 +72,13 @@ addons.mozilla.org
 itunes.apple.com
 www.icloud.com"
 
-info() { echo -e "${CYAN}$*${RESET}"; }
-ok() { echo -e "${GREEN}$*${RESET}"; }
-warn() { echo -e "${YELLOW}$*${RESET}"; }
+# All four write to stderr on purpose. Several functions return their value on
+# stdout via command substitution; if status messages went to stdout too they
+# would be captured into that value instead of being shown to the operator.
+# Diagnostics belong on stderr, so both streams still reach the terminal.
+info() { echo -e "${CYAN}$*${RESET}" >&2; }
+ok() { echo -e "${GREEN}$*${RESET}" >&2; }
+warn() { echo -e "${YELLOW}$*${RESET}" >&2; }
 err() { echo -e "${RED}$*${RESET}" >&2; }
 die() { err "$*"; exit 1; }
 
@@ -1095,22 +1099,26 @@ snell_verify_client_match() {
 }
 
 # Non-destructive decision point when a config already exists.
+# Returns one of: keep | regenerate | show | cancel
+# The menu goes to stderr because the caller captures stdout for the answer.
 snell_existing_config_choice() {
     local choice
 
-    echo
-    warn "An existing Snell config was found: ${MAIN_CONF}"
-    echo "1. Keep the current config and continue (recommended)"
-    echo "2. Back it up, then generate a new port/PSK"
-    echo "3. Show the current config, then decide"
-    echo "0. Cancel"
+    {
+        echo
+        warn "An existing Snell config was found: ${MAIN_CONF}"
+        echo "1. Keep the current config and continue (recommended)"
+        echo "2. Back it up, then generate a new port/PSK"
+        echo "3. Show the current config, then decide"
+        echo "0. Cancel"
+    } >&2
     read -rp "Select [0-3]: " choice
 
     case "${choice}" in
-        1) echo "keep" ;;
-        2) echo "regenerate" ;;
-        3) echo "show" ;;
-        *) echo "cancel" ;;
+        1) printf 'keep' ;;
+        2) printf 'regenerate' ;;
+        3) printf 'show' ;;
+        *) printf 'cancel' ;;
     esac
 }
 

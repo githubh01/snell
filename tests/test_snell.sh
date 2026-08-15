@@ -267,6 +267,32 @@ else
   t_ok "AnyTLS functions free of Reality logic"
 fi
 
+echo "== 17. Interactive choosers must not leak their menu into the return value =="
+# Regression: functions whose stdout is captured must print UI to stderr only.
+MAIN_CONF="$USERS_DIR/snell-main.conf"
+for pair in "1:keep" "2:regenerate" "3:show" "0:cancel" "9:cancel"; do
+  IFS=: read -r inp want <<<"$pair"
+  got="$(echo "$inp" | snell_existing_config_choice 2>/dev/null)"
+  check "chooser input '$inp' returns '$want'" "$got" "$want"
+done
+got="$(printf '6\nwww.example.com\n' | vless_prompt_sni 2>/dev/null)"
+check "custom SNI returns only the hostname" "$got" "www.example.com"
+got="$(printf '\n' | vless_prompt_sni 2>/dev/null)"
+check "default SNI returns only the hostname" "$got" "$VLESS_DEFAULT_SNI"
+got="$(printf '2\n' | vless_prompt_sni 2>/dev/null)"
+check "listed SNI returns only the hostname" "$got" "www.bing.com"
+
+# A polluted SNI would corrupt the Reality config, so assert it stays usable.
+SNI_OUT="$(printf '6\nwww.example.com\n' | vless_prompt_sni 2>/dev/null)"
+write_vless_config 8443 "$UUID" "$SNI_OUT" "$PRIV" "$SID"
+if jq -e . "$VLESS_CONFIG" >/dev/null 2>&1; then t_ok "config built from prompted SNI is valid JSON"; else t_bad "config built from prompted SNI is valid JSON" ""; fi
+check "prompted SNI lands intact in config" "$(vless_cfg_sni)" "www.example.com"
+
+echo "== 18. Status helpers write diagnostics to stderr, not stdout =="
+# info/ok/warn are diagnostics; nothing that returns data may emit them on stdout.
+out="$(info "x"; ok "y"; warn "z"; err "w"; true)"
+check "info/ok/warn/err produce no stdout" "$out" ""
+
 echo
 echo "=================================="
 echo " PASS: $PASS   FAIL: $FAIL"
