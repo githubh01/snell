@@ -3593,6 +3593,41 @@ report_firewall_for_port() {
     warn "host firewall allows it. Check your VPS control panel for port ${port}/tcp."
 }
 
+# Streams this service's log while the operator makes a real connection
+# attempt, so a current failure can be told apart from a stale log entry and
+# the exact rejection reason is seen as it happens.
+vless_watch_live() {
+    local seconds="${1:-60}"
+
+    require_root
+    if ! vless_is_installed; then
+        warn "VLESS+Reality is not installed."
+        return 0
+    fi
+
+    echo
+    info "Watching ${VLESS_SERVICE_NAME} for ${seconds} seconds."
+    warn "NOW: open your client and try to connect."
+    echo
+    echo "How to read what appears:"
+    echo "  'REALITY: processed invalid connection'"
+    echo "      -> the client reached the server but failed Reality auth."
+    echo "         pbk, sid or sni does not match. Re-import the share link."
+    echo "  nothing at all"
+    echo "      -> the client never reached this server. Suspect the cloud"
+    echo "         security group, or the client using a different address/port."
+    echo "  'inbound connection' with no error"
+    echo "      -> authentication succeeded; any remaining problem is routing."
+    echo
+    info "--- live log (stops automatically) ---"
+
+    timeout "${seconds}" journalctl -u "${VLESS_SERVICE_NAME}" -f --since now --no-pager 2>/dev/null || true
+
+    echo
+    info "--- watch finished ---"
+    return 0
+}
+
 # Distinguishes the failure modes that look identical from a client:
 # port unreachable, Reality handshake target unreachable, clock skew, or a
 # client-side flow/parameter mismatch.
@@ -3770,15 +3805,31 @@ vless_diagnose() {
     warn "   The client must support Reality + xtls-rprx-vision. If it connects"
     warn "   but no traffic flows, an unsupported or missing flow is the usual cause."
 
-    # 8. Recent errors
+    # 8. Errors, with an explicit age so stale entries are not mistaken for a
+    #    live failure.
     echo
-    info "8. Recent service errors"
-    if journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 200 2>/dev/null \
-        | grep -iE "error|fatal|reject|refused|timeout" | tail -n 10 | sed 's/^/   /'; then
-        :
+    info "8. Service errors"
+    local since_start recent_count old_count
+    since_start="$(systemctl show "${VLESS_SERVICE_NAME}" -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+    [ -n "${since_start}" ] && echo "   Service started: ${since_start}"
+
+    recent_count="$(journalctl -u "${VLESS_SERVICE_NAME}" --no-pager --since '-5 min' 2>/dev/null \
+        | grep -ciE "error|fatal|reject|refused" || true)"
+    old_count="$(journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 500 2>/dev/null \
+        | grep -ciE "error|fatal|reject|refused" || true)"
+
+    if [ "${recent_count:-0}" -gt 0 ]; then
+        err "   ${recent_count} error(s) in the LAST 5 MINUTES -- this is happening now:"
+        journalctl -u "${VLESS_SERVICE_NAME}" --no-pager --since '-5 min' 2>/dev/null \
+            | grep -iE "error|fatal|reject|refused" | tail -n 5 | sed 's/^/     /'
+    elif [ "${old_count:-0}" -gt 0 ]; then
+        warn "   No errors in the last 5 minutes, but ${old_count} older one(s) exist."
+        warn "   These may be stale. Use 'Watch live connection attempts' to test now."
+        journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 500 2>/dev/null \
+            | grep -iE "error|fatal|reject|refused" | tail -n 3 | sed 's/^/     /'
+    else
+        ok "   No errors found."
     fi
-    journalctl -u "${VLESS_SERVICE_NAME}" --no-pager -n 200 2>/dev/null \
-        | grep -iqE "error|fatal|reject|refused|timeout" || ok "   No obvious errors in the last 200 log lines."
 
     echo
     if [ "${problems}" -eq 0 ]; then
@@ -3812,10 +3863,11 @@ vless_menu() {
         echo "11. Stop service"
         echo "12. Show logs"
         echo "13. Diagnose connectivity (why clients cannot connect)"
-        echo "14. Uninstall VLESS+Reality"
+        echo "14. Watch live connection attempts (try your client now)"
+        echo "15. Uninstall VLESS+Reality"
         echo "0. Back"
         echo -e "${CYAN}============================================${RESET}"
-        read -rp "Select [0-14]: " choice
+        read -rp "Select [0-15]: " choice
         case "${choice}" in
             1) vless_install || true ;;
             2) vless_update || true ;;
@@ -3830,7 +3882,8 @@ vless_menu() {
             11) vless_stop ;;
             12) vless_logs ;;
             13) vless_diagnose || true ;;
-            14) vless_uninstall ;;
+            14) vless_watch_live 60 || true ;;
+            15) vless_uninstall ;;
             0) return 0 ;;
             *) err "Invalid option." ;;
         esac
