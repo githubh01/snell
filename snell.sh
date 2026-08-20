@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,11 +44,24 @@ ANYTLS_DOMAIN_FILE="${ANYTLS_DIR}/domain"
 CF_CERTBOT_CREDENTIALS="/etc/letsencrypt/cloudflare.ini"
 SING_BOX_DOWNLOADED_VERSION=""
 
+SNELL_RELEASE_NOTES_URLS=(
+    "https://manual.nssurge.com/others/snell.html"
+    "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
+)
+
 info() { echo -e "${CYAN}$*${RESET}"; }
 ok() { echo -e "${GREEN}$*${RESET}"; }
 warn() { echo -e "${YELLOW}$*${RESET}"; }
 err() { echo -e "${RED}$*${RESET}" >&2; }
 die() { err "$*"; exit 1; }
+
+confirm() {
+    local prompt="$1"
+    local answer
+
+    read -rp "${prompt}" answer
+    [[ "${answer}" =~ ^[Yy]$ ]]
+}
 
 require_root() {
     [ "$(id -u)" = "0" ] || die "Please run this script as root."
@@ -56,6 +69,23 @@ require_root() {
 
 has_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    curl -fL --proto '=https' --tlsv1.2 --connect-timeout 10 --retry 3 --retry-delay 2 "${url}" -o "${output}"
+}
+
+latest_github_release() {
+    local repo="$1"
+    local label="$2"
+    local version
+
+    version="$(curl -fsSL --connect-timeout 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+    [ -n "${version}" ] || die "Could not get the latest ${label} version from GitHub."
+    echo "${version}"
 }
 
 install_menu_shortcut() {
@@ -111,7 +141,6 @@ cleanup_old_script_files() {
     local shortcut_path
     local root_script_path
     local tmp_list
-    local confirm
     local removed=0
 
     require_root
@@ -168,8 +197,7 @@ EOF
     cat "${tmp_list}"
     echo
     warn "This will not remove Snell, AnyTLS, certificates, configs, /root/snell.sh, or the hardy shortcut."
-    read -rp "Delete the listed old script files now? [y/N]: " confirm
-    if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+    if ! confirm "Delete the listed old script files now? [y/N]: "; then
         rm -f "${tmp_list}"
         return 0
     fi
@@ -375,11 +403,12 @@ latest_from_official_docs() {
     local fallback="$2"
     local version=""
     local html=""
+    local url
 
-    html="$(curl -fsSL --connect-timeout 10 https://manual.nssurge.com/others/snell.html 2>/dev/null || true)"
-    if [ -z "${html}" ]; then
-        html="$(curl -fsSL --connect-timeout 10 https://kb.nssurge.com/surge-knowledge-base/release-notes/snell 2>/dev/null || true)"
-    fi
+    for url in "${SNELL_RELEASE_NOTES_URLS[@]}"; do
+        html="$(curl -fsSL --connect-timeout 10 "${url}" 2>/dev/null || true)"
+        [ -n "${html}" ] && break
+    done
 
     if [ -n "${html}" ]; then
         version="$(printf '%s\n' "${html}" | grep -Eo "snell-server-v${major}\.[0-9]+\.[0-9]+[a-z0-9]*" | sed 's/snell-server-//' | head -n 1 || true)"
@@ -419,7 +448,7 @@ random_psk() {
     if has_command openssl; then
         openssl rand -base64 24 | tr -d '\n'
     elif [ -r /dev/urandom ]; then
-        tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
+        dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | awk '{print substr($0, 1, 32)}'
     else
         date +%s%N | sha256sum | awk '{print $1}'
     fi
@@ -515,7 +544,7 @@ install_binary() {
     info "Downloading Snell ${version} (${arch})..."
     warn "Source: ${url}"
 
-    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/snell.zip"
+    download_file "${url}" "${tmpdir}/snell.zip"
     unzip -o "${tmpdir}/snell.zip" -d "${tmpdir}" >/dev/null
 
     if [ ! -f "${tmpdir}/snell-server" ]; then
@@ -533,7 +562,6 @@ install_snell() {
     local port
     local dns
     local psk
-    local overwrite
 
     require_root
     install_packages
@@ -544,8 +572,7 @@ install_snell() {
 
     if [ -f "${MAIN_CONF}" ]; then
         warn "Existing main config detected: ${MAIN_CONF}"
-        read -rp "Overwrite main config? [y/N]: " overwrite
-        if [[ ! "${overwrite}" =~ ^[Yy]$ ]]; then
+        if ! confirm "Overwrite main config? [y/N]: "; then
             write_service
             systemctl daemon-reload
             systemctl enable --now snell
@@ -569,20 +596,15 @@ install_snell() {
 }
 
 uninstall_snell() {
-    local confirm
-    local remove_conf
-
     require_root
     warn "This will stop and uninstall Snell. Config files can be kept."
-    read -rp "Confirm uninstall? [y/N]: " confirm
-    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+    confirm "Confirm uninstall? [y/N]: " || return 0
 
     systemctl disable --now snell 2>/dev/null || true
     rm -f "${SERVICE_FILE}" "${SNELL_BIN}"
     systemctl daemon-reload 2>/dev/null || true
 
-    read -rp "Remove config directory ${SNELL_DIR}? [y/N]: " remove_conf
-    if [[ "${remove_conf}" =~ ^[Yy]$ ]]; then
+    if confirm "Remove config directory ${SNELL_DIR}? [y/N]: "; then
         rm -rf "${SNELL_DIR}"
     fi
 
@@ -844,7 +866,6 @@ show_bbr_status() {
 }
 
 enable_bbr() {
-    local confirm
     local conf="/etc/sysctl.conf"
     local current_cc
     local current_qdisc
@@ -857,12 +878,10 @@ enable_bbr() {
     current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
     if [ "${current_cc}" = "bbr" ] && [ "${current_qdisc}" = "fq" ]; then
         ok "BBR is already active. No runtime change is needed."
-        read -rp "Ensure BBR is persisted in ${conf}? [y/N]: " confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+        confirm "Ensure BBR is persisted in ${conf}? [y/N]: " || return 0
     else
         warn "This will enable BBR by updating ${conf} and running sysctl -p."
-        read -rp "Enable BBR now? [y/N]: " confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+        confirm "Enable BBR now? [y/N]: " || return 0
     fi
 
     if ! modprobe tcp_bbr 2>/dev/null; then
@@ -919,11 +938,7 @@ sing_box_arch() {
 }
 
 sing_box_latest_version() {
-    local version
-
-    version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-    [ -n "${version}" ] || die "Could not get latest sing-box version from GitHub."
-    echo "${version}"
+    latest_github_release "SagerNet/sing-box" "sing-box"
 }
 
 install_sing_box_binary() {
@@ -947,7 +962,7 @@ install_sing_box_binary() {
     info "Downloading sing-box ${version} (${arch})..."
     warn "Source: ${url}"
 
-    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/sing-box.tar.gz"
+    download_file "${url}" "${tmpdir}/sing-box.tar.gz"
     tar xzf "${tmpdir}/sing-box.tar.gz" -C "${tmpdir}"
 
     [ -f "${tmpdir}/${name}/sing-box" ] || {
@@ -990,7 +1005,7 @@ random_available_port() {
         if has_command shuf; then
             port="$(shuf -i 2000-65000 -n 1)"
         else
-            port="$(awk 'BEGIN{srand(); print int(2000 + rand() * 63000)}')"
+            port="$((2000 + RANDOM % 63001))"
         fi
         if ! is_port_used "${port}"; then
             echo "${port}"
@@ -1058,11 +1073,7 @@ anytls_public_ip() {
 }
 
 anytls_latest_version() {
-    local version
-
-    version="$(curl -fsSL --connect-timeout 10 https://api.github.com/repos/anytls/anytls-go/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-    [ -n "${version}" ] || die "Could not get the latest AnyTLS version from GitHub."
-    echo "${version}"
+    latest_github_release "anytls/anytls-go" "AnyTLS"
 }
 
 anytls_installed_version() {
@@ -1250,7 +1261,7 @@ certbot_issue_standalone() {
     local domain="$1"
     local email="$2"
     local staging="${3:-false}"
-    local staging_arg=""
+    local staging_args=()
     local account_args=()
 
     install_acme_packages
@@ -1260,7 +1271,7 @@ certbot_issue_standalone() {
     fi
 
     if [ "${staging}" = "true" ]; then
-        staging_arg="--test-cert"
+        staging_args=(--test-cert)
     fi
 
     if [ -n "${email}" ]; then
@@ -1273,7 +1284,7 @@ certbot_issue_standalone() {
         --preferred-challenges http \
         "${account_args[@]}" \
         -d "${domain}" \
-        ${staging_arg}
+        "${staging_args[@]}"
 }
 
 certbot_issue_cloudflare() {
@@ -1371,7 +1382,7 @@ anytls_download_binary() {
     info "Downloading AnyTLS ${version} (${arch})..."
     warn "Source: ${url}"
 
-    curl -fL --proto '=https' --tlsv1.2 "${url}" -o "${tmpdir}/anytls.zip"
+    download_file "${url}" "${tmpdir}/anytls.zip"
     unzip -o "${tmpdir}/anytls.zip" -d "${tmpdir}" >/dev/null
 
     [ -f "${tmpdir}/anytls-server" ] || {
@@ -1512,7 +1523,6 @@ anytls_update() {
 anytls_install_with_acme_cert() {
     local domain
     local email
-    local staging_choice
     local staging="false"
     local cert_pair
     local cert_path
@@ -1528,8 +1538,7 @@ anytls_install_with_acme_cert() {
     read -rp "Domain for AnyTLS certificate: " domain
     [ -n "${domain}" ] || die "Domain is required."
     read -rp "Email for Let's Encrypt notices [Enter = no email]: " email
-    read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
-    if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
+    if confirm "Use Let's Encrypt staging/test certificate? [y/N]: "; then
         staging="true"
     fi
 
@@ -1562,7 +1571,6 @@ anytls_install_with_cloudflare_cert() {
     local email
     local token
     local propagation
-    local staging_choice
     local staging="false"
     local cert_pair
     local cert_path
@@ -1590,8 +1598,7 @@ anytls_install_with_cloudflare_cert() {
     read -rp "DNS propagation wait seconds [Enter = 60]: " propagation
     propagation="${propagation:-60}"
     [[ "${propagation}" =~ ^[0-9]+$ ]] || die "Invalid propagation seconds: ${propagation}"
-    read -rp "Use Let's Encrypt staging/test certificate? [y/N]: " staging_choice
-    if [[ "${staging_choice}" =~ ^[Yy]$ ]]; then
+    if confirm "Use Let's Encrypt staging/test certificate? [y/N]: "; then
         staging="true"
     fi
 
@@ -1663,13 +1670,10 @@ renew_anytls_certificate() {
 }
 
 anytls_uninstall() {
-    local confirm
-
     require_root
     anytls_is_installed || die "AnyTLS is not installed."
 
-    read -rp "Uninstall AnyTLS and delete ${ANYTLS_DIR}? [y/N]: " confirm
-    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+    confirm "Uninstall AnyTLS and delete ${ANYTLS_DIR}? [y/N]: " || return 0
 
     systemctl disable --now "${ANYTLS_SERVICE_NAME}" 2>/dev/null || true
     rm -f "${ANYTLS_SERVICE_FILE}"
@@ -1892,8 +1896,6 @@ add_user() {
 remove_user() {
     local port
     local file
-    local confirm
-
     require_root
 
     read -rp "Additional user port to remove: " port
@@ -1902,8 +1904,7 @@ remove_user() {
 
     [ -f "${file}" ] || die "Config not found: ${file}"
 
-    read -rp "Remove ${file}? [y/N]: " confirm
-    [[ "${confirm}" =~ ^[Yy]$ ]] || return 0
+    confirm "Remove ${file}? [y/N]: " || return 0
     rm -f "${file}"
     ok "Removed: ${file}"
 }
